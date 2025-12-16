@@ -119,6 +119,7 @@ class AgentConfig:
     max_retries: int = 3
     dry_run: bool = False  # If True, commands are printed but not executed
     verbose: bool = True
+    web_search: bool = False  # If True, search web for up-to-date installation docs
 
     # OpenAI-compatible API configuration (for local LLMs)
     openai_compatible_config: Optional[OpenAICompatibleConfig] = None
@@ -619,6 +620,211 @@ class SystemAnalyzer:
 
 
 # ============================================================================
+# Web Search - Fetch up-to-date installation instructions
+# ============================================================================
+
+@dataclass
+class WebSearchResult:
+    """A single search result"""
+    title: str
+    url: str
+    snippet: str
+    content: str = ""  # Full page content if fetched
+
+
+class WebSearcher:
+    """
+    Fetches up-to-date installation documentation from the web.
+    Uses DuckDuckGo for search (no API key required) and fetches page content.
+    """
+
+    # Sites known to have good installation docs
+    TRUSTED_SOURCES = [
+        "github.com",
+        "docs.docker.com",
+        "wiki.archlinux.org",
+        "ubuntu.com",
+        "debian.org",
+        "digitalocean.com",
+        "linuxize.com",
+        "phoenixnap.com",
+        "tecmint.com",
+    ]
+
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+
+    def _log(self, msg: str):
+        if self.verbose:
+            print(f"  [WebSearch] {msg}")
+
+    def search_duckduckgo(self, query: str, max_results: int = 5) -> list[WebSearchResult]:
+        """Search DuckDuckGo for installation instructions"""
+        import urllib.request
+        import urllib.parse
+        import urllib.error
+
+        results = []
+
+        try:
+            # Use DuckDuckGo HTML search (no API key needed)
+            search_query = urllib.parse.quote(f"{query} installation guide linux")
+            url = f"https://html.duckduckgo.com/html/?q={search_query}"
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+            }
+            req = urllib.request.Request(url, headers=headers)
+
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+
+            # Parse results using regex (avoiding external dependencies)
+            # DuckDuckGo HTML results have class="result__a" for links
+            pattern = r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>'
+            matches = re.findall(pattern, html, re.IGNORECASE)
+
+            # Also try to get snippets
+            snippet_pattern = r'<a[^>]+class="result__snippet"[^>]*>([^<]+)</a>'
+            snippets = re.findall(snippet_pattern, html, re.IGNORECASE)
+
+            for i, (result_url, title) in enumerate(matches[:max_results]):
+                # DuckDuckGo wraps URLs, extract the actual URL
+                if 'uddg=' in result_url:
+                    actual_url = urllib.parse.unquote(result_url.split('uddg=')[1].split('&')[0])
+                else:
+                    actual_url = result_url
+
+                snippet = snippets[i] if i < len(snippets) else ""
+                snippet = re.sub(r'<[^>]+>', '', snippet)  # Remove HTML tags
+
+                results.append(WebSearchResult(
+                    title=title.strip(),
+                    url=actual_url,
+                    snippet=snippet.strip()
+                ))
+
+            self._log(f"Found {len(results)} search results")
+
+        except Exception as e:
+            self._log(f"Search failed: {e}")
+
+        return results
+
+    def fetch_page_content(self, url: str, max_chars: int = 15000) -> str:
+        """Fetch and extract text content from a URL"""
+        import urllib.request
+        import urllib.error
+
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+            }
+            req = urllib.request.Request(url, headers=headers)
+
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+
+            # Extract text content (basic HTML stripping)
+            # Remove script and style blocks
+            html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+
+            # Extract code blocks (these are important for installation)
+            code_blocks = re.findall(r'<(?:pre|code)[^>]*>(.*?)</(?:pre|code)>', html, flags=re.DOTALL | re.IGNORECASE)
+
+            # Remove HTML tags
+            text = re.sub(r'<[^>]+>', ' ', html)
+
+            # Clean up whitespace
+            text = re.sub(r'\s+', ' ', text)
+            text = text.strip()
+
+            # Prioritize code blocks in the output
+            if code_blocks:
+                code_text = "\n\n[CODE BLOCKS FOUND]:\n"
+                for block in code_blocks[:10]:  # Limit to 10 code blocks
+                    block_text = re.sub(r'<[^>]+>', '', block).strip()
+                    if block_text and len(block_text) > 10:
+                        code_text += f"\n```\n{block_text}\n```\n"
+                text = text[:max_chars - len(code_text)] + code_text
+
+            return text[:max_chars]
+
+        except Exception as e:
+            self._log(f"Failed to fetch {url}: {e}")
+            return ""
+
+    def fetch_github_readme(self, repo_url: str) -> str:
+        """Fetch README from a GitHub repository"""
+        import urllib.request
+        import urllib.error
+
+        try:
+            # Convert GitHub URL to raw README URL
+            # https://github.com/user/repo -> https://raw.githubusercontent.com/user/repo/main/README.md
+            if 'github.com' in repo_url:
+                parts = repo_url.replace('https://github.com/', '').replace('http://github.com/', '').split('/')
+                if len(parts) >= 2:
+                    user, repo = parts[0], parts[1].split('#')[0].split('?')[0]
+
+                    # Try main branch first, then master
+                    for branch in ['main', 'master']:
+                        for readme in ['README.md', 'readme.md', 'README.rst', 'README']:
+                            raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{readme}"
+                            try:
+                                req = urllib.request.Request(raw_url)
+                                with urllib.request.urlopen(req, timeout=10) as response:
+                                    content = response.read().decode('utf-8', errors='ignore')
+                                    self._log(f"Fetched README from {user}/{repo}")
+                                    return content[:15000]
+                            except urllib.error.HTTPError:
+                                continue
+
+        except Exception as e:
+            self._log(f"Failed to fetch GitHub README: {e}")
+
+        return ""
+
+    def search_installation_docs(self, software: str, os_info: str = "ubuntu") -> dict:
+        """
+        Search for installation documentation for a specific software.
+        Returns a dict with search results and fetched content.
+        """
+        self._log(f"Searching for installation docs: {software}")
+
+        # Build search query
+        query = f"{software} install {os_info}"
+
+        # Search DuckDuckGo
+        results = self.search_duckduckgo(query)
+
+        # Fetch content from top results
+        fetched_content = []
+        for result in results[:3]:  # Fetch top 3 results
+            self._log(f"Fetching: {result.title[:50]}...")
+
+            if 'github.com' in result.url:
+                content = self.fetch_github_readme(result.url)
+            else:
+                content = self.fetch_page_content(result.url)
+
+            if content:
+                result.content = content
+                fetched_content.append({
+                    "title": result.title,
+                    "url": result.url,
+                    "content": content[:5000]  # Limit per-source content
+                })
+
+        return {
+            "query": query,
+            "results": [{"title": r.title, "url": r.url, "snippet": r.snippet} for r in results],
+            "fetched_docs": fetched_content
+        }
+
+
+# ============================================================================
 # LLM Reasoner - The AI brain of the installer
 # ============================================================================
 
@@ -846,11 +1052,23 @@ You have deep knowledge of:
 
     def analyze_requirements(self,
                             system_info: SystemInfo,
-                            software_request: str) -> dict:
+                            software_request: str,
+                            web_docs: Optional[dict] = None) -> dict:
         """Analyze what's needed to install the requested software"""
 
         # Get installed packages as a clear list for the prompt
         installed_pkgs = system_info.installed_packages if hasattr(system_info, 'installed_packages') else []
+
+        # Build web documentation section if available
+        web_docs_section = ""
+        if web_docs and web_docs.get("fetched_docs"):
+            web_docs_section = "\n\nUP-TO-DATE INSTALLATION DOCUMENTATION FROM THE WEB:\n"
+            web_docs_section += "Use this documentation to ensure you have the LATEST installation commands.\n"
+            web_docs_section += "Prefer commands from official documentation over your training data.\n\n"
+            for doc in web_docs["fetched_docs"][:3]:
+                web_docs_section += f"--- Source: {doc['title']} ---\n"
+                web_docs_section += f"URL: {doc['url']}\n"
+                web_docs_section += f"{doc['content'][:4000]}\n\n"
 
         prompt = f"""
 Analyze the following system and determine what's needed to install the requested software.
@@ -863,10 +1081,11 @@ ALREADY INSTALLED PACKAGES (use this to determine prerequisite status):
 
 SOFTWARE REQUEST:
 {software_request}
-
+{web_docs_section}
 IMPORTANT: When filling out "prerequisites", check the ALREADY INSTALLED PACKAGES list above.
 - If a package (like "curl", "gnupg", "gnupg2", "git", etc.) appears in that list, set status to "installed"
 - Only set status to "missing" if the package is NOT in the installed packages list
+- If web documentation is provided above, PRIORITIZE those installation commands over your training data
 
 Respond with a JSON object containing:
 {{
@@ -1883,6 +2102,7 @@ class AIInstallationAgent:
         self.executor = CommandExecutor(dry_run=config.dry_run, verbose=config.verbose)
         self.test_runner = TestRunner(self.executor, verbose=config.verbose)
         self.plan_enhancer = PlanEnhancer(verbose=config.verbose)
+        self.web_searcher = WebSearcher(verbose=config.verbose) if config.web_search else None
 
         # Initialize LLM
         if config.llm_provider == LLMProvider.ANTHROPIC:
@@ -1979,10 +2199,24 @@ class AIInstallationAgent:
 
         # Phase 2: AI Analysis & Planning
         self._print_section("Phase 2: AI Planning Installation")
+
+        # Optional: Search web for up-to-date installation docs
+        web_docs = None
+        if self.web_searcher:
+            print("🌐 Searching web for up-to-date installation instructions...")
+            os_info = f"{self.system_info.os_type} {self.system_info.os_version}"
+            web_docs = self.web_searcher.search_installation_docs(software_request, os_info)
+            if web_docs.get("fetched_docs"):
+                print(f"   Found {len(web_docs['fetched_docs'])} documentation sources")
+                for doc in web_docs['fetched_docs'][:3]:
+                    print(f"   📄 {doc['title'][:60]}...")
+            else:
+                print("   ⚠️  No documentation found, using LLM knowledge only")
+
         print("Consulting AI for installation plan...")
 
         try:
-            plan = self.reasoner.analyze_requirements(self.system_info, software_request)
+            plan = self.reasoner.analyze_requirements(self.system_info, software_request, web_docs=web_docs)
         except Exception as e:
             return {
                 "success": False,
@@ -2425,6 +2659,8 @@ Supported local providers (presets):
                        help="Don't execute commands, just show what would happen")
     parser.add_argument("--no-confirm", action="store_true",
                        help="Don't ask for confirmations before each step")
+    parser.add_argument("--web-search", "-w", action="store_true",
+                       help="Search the web for up-to-date installation instructions")
     parser.add_argument("--example", action="store_true",
                        help="Run the ROCm installation example")
     parser.add_argument("--example-local", action="store_true",
@@ -2487,7 +2723,8 @@ Supported local providers (presets):
             llm_provider=LLMProvider.OPENAI_COMPATIBLE,
             openai_compatible_config=local_config,
             dry_run=args.dry_run,
-            verbose=True
+            verbose=True,
+            web_search=args.web_search
         )
 
         # Handle test-connection mode
@@ -2521,14 +2758,16 @@ Supported local providers (presets):
             llm_provider=LLMProvider.OPENAI,
             model_name=args.model or "gpt-4o",
             dry_run=args.dry_run,
-            verbose=True
+            verbose=True,
+            web_search=args.web_search
         )
     else:  # anthropic
         config = AgentConfig(
             llm_provider=LLMProvider.ANTHROPIC,
             model_name=args.model or "claude-sonnet-4-20250514",
             dry_run=args.dry_run,
-            verbose=True
+            verbose=True,
+            web_search=args.web_search
         )
 
     # Require software argument for actual installation
