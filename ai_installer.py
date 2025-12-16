@@ -139,6 +139,35 @@ class AgentConfig:
 # ============================================================================
 
 @dataclass
+class GPUInfo:
+    """Detailed GPU information"""
+    vendor: str = ""  # "nvidia", "amd", "intel", "unknown"
+    name: str = ""
+    driver_version: Optional[str] = None
+    vram_total: Optional[str] = None
+    vram_used: Optional[str] = None
+    cuda_version: Optional[str] = None
+    cudnn_version: Optional[str] = None
+    compute_capability: Optional[str] = None
+    rocm_version: Optional[str] = None
+    pci_bus_id: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in {
+            "vendor": self.vendor,
+            "name": self.name,
+            "driver_version": self.driver_version,
+            "vram_total": self.vram_total,
+            "vram_used": self.vram_used,
+            "cuda_version": self.cuda_version,
+            "cudnn_version": self.cudnn_version,
+            "compute_capability": self.compute_capability,
+            "rocm_version": self.rocm_version,
+            "pci_bus_id": self.pci_bus_id,
+        }.items() if v is not None and v != ""}
+
+
+@dataclass
 class SystemInfo:
     """Comprehensive system information"""
     os_type: str = ""
@@ -149,8 +178,25 @@ class SystemInfo:
     wsl_version: Optional[str] = None
     distro_name: str = ""
     distro_version: str = ""
+
+    # GPU Information (legacy list for backward compatibility)
     gpu_info: list = field(default_factory=list)
     gpu_driver_version: Optional[str] = None
+
+    # Enhanced GPU Information
+    gpus: list = field(default_factory=list)  # List of GPUInfo objects
+    nvidia_detected: bool = False
+    amd_detected: bool = False
+    intel_gpu_detected: bool = False
+
+    # CUDA/ROCm specific
+    cuda_version: Optional[str] = None
+    cuda_toolkit_path: Optional[str] = None
+    cudnn_version: Optional[str] = None
+    nvcc_version: Optional[str] = None
+    rocm_version: Optional[str] = None
+
+    # Other
     installed_packages: list = field(default_factory=list)
     environment_vars: dict = field(default_factory=dict)
     disk_space: dict = field(default_factory=dict)
@@ -168,6 +214,15 @@ class SystemInfo:
             "distro_version": self.distro_version,
             "gpu_info": self.gpu_info,
             "gpu_driver_version": self.gpu_driver_version,
+            "gpus": [g.to_dict() if hasattr(g, 'to_dict') else g for g in self.gpus],
+            "nvidia_detected": self.nvidia_detected,
+            "amd_detected": self.amd_detected,
+            "intel_gpu_detected": self.intel_gpu_detected,
+            "cuda_version": self.cuda_version,
+            "cuda_toolkit_path": self.cuda_toolkit_path,
+            "cudnn_version": self.cudnn_version,
+            "nvcc_version": self.nvcc_version,
+            "rocm_version": self.rocm_version,
             "installed_packages": self.installed_packages[:50],  # Limit for context
             "disk_space": self.disk_space,
             "memory_info": self.memory_info,
@@ -262,37 +317,228 @@ class SystemAnalyzer:
                     info.wsl_version = "1"
 
     def _detect_gpu(self, info: SystemInfo):
-        """Detect GPU information"""
+        """Detect GPU information including NVIDIA/CUDA, AMD/ROCm, and Intel"""
         self._log("Detecting GPU hardware...")
 
-        # Try lspci for GPU detection
+        # Try lspci for GPU detection (legacy list for backward compatibility)
         code, out, _ = self._run_cmd("lspci 2>/dev/null | grep -iE 'vga|3d|display'")
         if code == 0 and out:
             info.gpu_info = [line.strip() for line in out.split('\n') if line.strip()]
 
-        # AMD-specific driver version
+            # Detect vendor from lspci output
+            for line in info.gpu_info:
+                line_lower = line.lower()
+                if 'nvidia' in line_lower:
+                    info.nvidia_detected = True
+                if 'amd' in line_lower or 'radeon' in line_lower:
+                    info.amd_detected = True
+                if 'intel' in line_lower:
+                    info.intel_gpu_detected = True
+
+        # =====================================================================
+        # NVIDIA / CUDA Detection
+        # =====================================================================
+        self._detect_nvidia_cuda(info)
+
+        # =====================================================================
+        # AMD / ROCm Detection
+        # =====================================================================
+        self._detect_amd_rocm(info)
+
+    def _detect_nvidia_cuda(self, info: SystemInfo):
+        """Detect NVIDIA GPU and CUDA toolkit"""
+        self._log("Checking for NVIDIA/CUDA...")
+
+        # Try nvidia-smi for detailed GPU info
+        code, out, _ = self._run_cmd("nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,pci.bus_id,compute_cap --format=csv,noheader,nounits 2>/dev/null")
+        if code == 0 and out:
+            info.nvidia_detected = True
+            for line in out.strip().split('\n'):
+                if line.strip():
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) >= 4:
+                        gpu = GPUInfo(
+                            vendor="nvidia",
+                            name=parts[0] if len(parts) > 0 else "",
+                            driver_version=parts[1] if len(parts) > 1 else None,
+                            vram_total=f"{parts[2]} MiB" if len(parts) > 2 else None,
+                            vram_used=f"{parts[3]} MiB" if len(parts) > 3 else None,
+                            pci_bus_id=parts[4] if len(parts) > 4 else None,
+                            compute_capability=parts[5] if len(parts) > 5 else None,
+                        )
+                        info.gpus.append(gpu)
+                        # Set driver version from first GPU
+                        if not info.gpu_driver_version:
+                            info.gpu_driver_version = gpu.driver_version
+
+        # Get CUDA version from nvidia-smi
+        code, out, _ = self._run_cmd("nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \\K[0-9.]+'")
+        if code == 0 and out:
+            info.cuda_version = out.strip()
+            info.nvidia_detected = True
+
+        # Get nvcc version (CUDA toolkit compiler)
+        code, out, _ = self._run_cmd("nvcc --version 2>/dev/null | grep -oP 'release \\K[0-9.]+'")
+        if code == 0 and out:
+            info.nvcc_version = out.strip()
+
+        # Find CUDA toolkit path
+        cuda_paths = [
+            "/usr/local/cuda",
+            "/usr/local/cuda-12",
+            "/usr/local/cuda-11",
+            "/opt/cuda",
+        ]
+        for path in cuda_paths:
+            if os.path.exists(path):
+                info.cuda_toolkit_path = path
+                break
+
+        # Also check CUDA_HOME environment variable
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if cuda_home and os.path.exists(cuda_home):
+            info.cuda_toolkit_path = cuda_home
+
+        # Detect cuDNN version
+        self._detect_cudnn(info)
+
+        # If we have CUDA but no GPU info yet from nvidia-smi, try basic detection
+        if info.nvidia_detected and not info.gpus:
+            code, out, _ = self._run_cmd("nvidia-smi -L 2>/dev/null")
+            if code == 0 and out:
+                for line in out.strip().split('\n'):
+                    if line.strip():
+                        # Parse lines like "GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-...)"
+                        match = re.search(r'GPU \d+: (.+?)(?:\s*\(UUID|$)', line)
+                        if match:
+                            gpu = GPUInfo(vendor="nvidia", name=match.group(1).strip())
+                            info.gpus.append(gpu)
+
+    def _detect_cudnn(self, info: SystemInfo):
+        """Detect cuDNN version"""
+        cudnn_paths = []
+
+        # Check common cuDNN header locations
+        if info.cuda_toolkit_path:
+            cudnn_paths.append(f"{info.cuda_toolkit_path}/include/cudnn_version.h")
+            cudnn_paths.append(f"{info.cuda_toolkit_path}/include/cudnn.h")
+
+        cudnn_paths.extend([
+            "/usr/include/cudnn_version.h",
+            "/usr/include/cudnn.h",
+            "/usr/local/include/cudnn_version.h",
+            "/usr/include/x86_64-linux-gnu/cudnn_version.h",
+        ])
+
+        for path in cudnn_paths:
+            if os.path.exists(path):
+                code, out, _ = self._run_cmd(f"grep -E 'CUDNN_MAJOR|CUDNN_MINOR|CUDNN_PATCHLEVEL' {path} 2>/dev/null | head -3")
+                if code == 0 and out:
+                    major = minor = patch = ""
+                    for line in out.split('\n'):
+                        if 'CUDNN_MAJOR' in line and 'VERSION' not in line:
+                            match = re.search(r'(\d+)', line.split('CUDNN_MAJOR')[-1])
+                            if match:
+                                major = match.group(1)
+                        elif 'CUDNN_MINOR' in line:
+                            match = re.search(r'(\d+)', line.split('CUDNN_MINOR')[-1])
+                            if match:
+                                minor = match.group(1)
+                        elif 'CUDNN_PATCHLEVEL' in line:
+                            match = re.search(r'(\d+)', line.split('CUDNN_PATCHLEVEL')[-1])
+                            if match:
+                                patch = match.group(1)
+                    if major:
+                        info.cudnn_version = f"{major}.{minor}.{patch}".rstrip('.')
+                        break
+
+        # Alternative: try to get cuDNN version from ldconfig
+        if not info.cudnn_version:
+            code, out, _ = self._run_cmd("ldconfig -p 2>/dev/null | grep libcudnn | head -1")
+            if code == 0 and out:
+                match = re.search(r'libcudnn\.so\.(\d+)', out)
+                if match:
+                    info.cudnn_version = f"{match.group(1)}.x"
+
+    def _detect_amd_rocm(self, info: SystemInfo):
+        """Detect AMD GPU and ROCm"""
+        self._log("Checking for AMD/ROCm...")
+
+        # AMD driver version from kernel module
         code, out, _ = self._run_cmd("cat /sys/module/amdgpu/version 2>/dev/null")
         if code == 0 and out:
-            info.gpu_driver_version = out
+            info.amd_detected = True
+            if not info.gpu_driver_version:
+                info.gpu_driver_version = out.strip()
 
-        # Also check for rocm-smi
+        # ROCm version detection
+        rocm_paths = [
+            "/opt/rocm/.info/version",
+            "/opt/rocm/include/rocm-core/rocm_version.h",
+            "/opt/rocm/.info/version-dev",
+        ]
+
+        for path in rocm_paths:
+            if os.path.exists(path):
+                code, out, _ = self._run_cmd(f"cat {path} 2>/dev/null | head -1")
+                if code == 0 and out:
+                    # Clean up version string
+                    version = out.strip()
+                    match = re.search(r'[\d.]+', version)
+                    if match:
+                        info.rocm_version = match.group(0)
+                        break
+
+        # Try rocm-smi for GPU info
+        code, out, _ = self._run_cmd("rocm-smi --showproductname 2>/dev/null")
+        if code == 0 and out:
+            info.amd_detected = True
+            for line in out.split('\n'):
+                if 'GPU' in line or 'Card' in line:
+                    # Parse GPU name
+                    match = re.search(r'(?:GPU\[\d+\]|Card\s*\d*).*?:\s*(.+)', line)
+                    if match:
+                        gpu = GPUInfo(vendor="amd", name=match.group(1).strip())
+                        info.gpus.append(gpu)
+
+        # Get driver version from rocm-smi
         code, out, _ = self._run_cmd("rocm-smi --showdriverversion 2>/dev/null")
         if code == 0 and out:
-            info.gpu_driver_version = out
+            match = re.search(r'[\d.]+', out)
+            if match:
+                info.gpu_driver_version = match.group(0)
+
+        # Get VRAM info from rocm-smi
+        code, out, _ = self._run_cmd("rocm-smi --showmeminfo vram 2>/dev/null")
+        if code == 0 and out and info.gpus:
+            for i, gpu in enumerate(info.gpus):
+                if gpu.vendor == "amd":
+                    # Parse VRAM info
+                    total_match = re.search(r'Total.*?(\d+)', out)
+                    used_match = re.search(r'Used.*?(\d+)', out)
+                    if total_match:
+                        gpu.vram_total = f"{int(total_match.group(1)) // (1024*1024)} MiB"
+                    if used_match:
+                        gpu.vram_used = f"{int(used_match.group(1)) // (1024*1024)} MiB"
 
     def _detect_packages(self, info: SystemInfo):
         """Detect installed packages relevant to the installation"""
         self._log("Scanning installed packages...")
 
-        # Debian/Ubuntu
-        code, out, _ = self._run_cmd("dpkg -l 2>/dev/null | grep -iE 'rocm|amdgpu|hip|opencl' | awk '{print $2}'")
+        # Debian/Ubuntu - GPU related packages
+        code, out, _ = self._run_cmd("dpkg -l 2>/dev/null | grep -iE 'rocm|amdgpu|hip|opencl|cuda|nvidia|cudnn|nccl|tensorrt' | awk '{print $2}'")
         if code == 0 and out:
-            info.installed_packages.extend(out.split('\n'))
+            info.installed_packages.extend([p for p in out.split('\n') if p.strip()])
 
-        # Also check pip packages
-        code, out, _ = self._run_cmd("pip list 2>/dev/null | grep -iE 'torch|tensorflow|rocm'")
+        # Also check pip packages for ML frameworks
+        code, out, _ = self._run_cmd("pip list 2>/dev/null | grep -iE 'torch|tensorflow|jax|cuda|rocm|nvidia'")
         if code == 0 and out:
-            info.installed_packages.extend([f"pip:{line.split()[0]}" for line in out.split('\n') if line])
+            info.installed_packages.extend([f"pip:{line.split()[0]}" for line in out.split('\n') if line.strip()])
+
+        # Check conda packages if conda is available
+        code, out, _ = self._run_cmd("conda list 2>/dev/null | grep -iE 'cuda|cudnn|pytorch|tensorflow' | awk '{print $1}'")
+        if code == 0 and out:
+            info.installed_packages.extend([f"conda:{p}" for p in out.split('\n') if p.strip()])
 
     def _detect_resources(self, info: SystemInfo):
         """Detect system resources (disk, memory)"""
@@ -1191,7 +1437,41 @@ class AIInstallationAgent:
         print(f"OS: {self.system_info.distro_name} {self.system_info.distro_version}")
         print(f"Kernel: {self.system_info.kernel_version}")
         print(f"WSL: {'Yes (v' + self.system_info.wsl_version + ')' if self.system_info.is_wsl else 'No'}")
-        print(f"GPU: {', '.join(self.system_info.gpu_info) if self.system_info.gpu_info else 'None detected'}")
+
+        # Enhanced GPU display
+        if self.system_info.gpus:
+            print(f"GPU(s) detected: {len(self.system_info.gpus)}")
+            for i, gpu in enumerate(self.system_info.gpus):
+                gpu_dict = gpu.to_dict() if hasattr(gpu, 'to_dict') else gpu
+                vendor = gpu_dict.get('vendor', 'unknown').upper()
+                name = gpu_dict.get('name', 'Unknown')
+                vram = gpu_dict.get('vram_total', '')
+                print(f"  [{i}] {vendor}: {name}" + (f" ({vram})" if vram else ""))
+        elif self.system_info.gpu_info:
+            print(f"GPU: {', '.join(self.system_info.gpu_info)}")
+        else:
+            print("GPU: None detected")
+
+        # CUDA/ROCm info
+        if self.system_info.nvidia_detected:
+            cuda_info = []
+            if self.system_info.cuda_version:
+                cuda_info.append(f"CUDA {self.system_info.cuda_version}")
+            if self.system_info.cudnn_version:
+                cuda_info.append(f"cuDNN {self.system_info.cudnn_version}")
+            if self.system_info.gpu_driver_version:
+                cuda_info.append(f"Driver {self.system_info.gpu_driver_version}")
+            if cuda_info:
+                print(f"NVIDIA Stack: {', '.join(cuda_info)}")
+
+        if self.system_info.amd_detected:
+            rocm_info = []
+            if self.system_info.rocm_version:
+                rocm_info.append(f"ROCm {self.system_info.rocm_version}")
+            if self.system_info.gpu_driver_version and not self.system_info.nvidia_detected:
+                rocm_info.append(f"Driver {self.system_info.gpu_driver_version}")
+            if rocm_info:
+                print(f"AMD Stack: {', '.join(rocm_info)}")
 
         # Phase 2: AI Analysis & Planning
         self._print_section("Phase 2: AI Planning Installation")
