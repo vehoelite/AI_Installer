@@ -1,4 +1,4 @@
-# AI_Installer
+# AI Installer CLI & GUI
 Install software with AI support!
 
 # Steps your AI Agent will make
@@ -76,7 +76,7 @@ The script is organized into 5 core components:
     - Validate → Test installation
     - Troubleshoot → Auto-fix failures
 
-# 🚀 Usage Examples
+# 🚀 Usage Examples for CLI
 
 ## Dry run (test without executing)
 ```sh
@@ -154,7 +154,7 @@ python ai_installer.py --provider local --local-preset ollama --list-models
 - 📦 Docker Image Support
 - 🤖 Automatic Troubleshooter & Repair
 
-# Prerequisites
+# Prerequisites for CLI
 ```sh
 python3 -m venv venv
 source venv/bin/activate
@@ -162,3 +162,11 @@ pip install anthropic  # or openai
 export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY
 ```
 
+# Prerequisites for GUI
+```sh
+python3 -m venv venv
+source venv/bin/activate
+pip install anthropic  # or openai
+pip install PySide6
+python ai_installer_gui.py
+```
