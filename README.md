@@ -3,7 +3,7 @@ Install software with AI support!
 
 # Steps your AI Agent will make
 1. Analyze the target system state
-2. Plan the installation steps based on requirements
+2. Plan the installation steps based on requirements and user support.
 3. Execute commands with proper error handling
 4. Validate the installation through tests
 5. Troubleshoot failures autonomously
@@ -34,6 +34,7 @@ The script is organized into 5 core components:
     Gathers comprehensive system information:
 
     - OS type, version, kernel
+    - Port in use
     - WSL detection (version 1 or 2)
     - GPU hardware & driver versions
     - Installed packages (apt, pip, docker)
@@ -44,6 +45,7 @@ The script is organized into 5 core components:
     The AI brain that:
 
     - Analyzes system state vs software requirements
+    - Gathers user's configuration requests
     - Plans installation steps with proper ordering
     - Generates validation tests
     - Troubleshoots failures with targeted fixes
@@ -146,6 +148,7 @@ python ai_installer.py --provider local --local-preset ollama --list-models
 
 # Features
 - 📋 System Analyze & Scanning
+- ⚙️ Configure Using Plain Language
 - 🌐 Web Search
 - 🛡️ Dangerous Command Safety Filter
 - 📦 Docker Image Support
