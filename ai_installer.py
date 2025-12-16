@@ -1135,9 +1135,11 @@ class PlanEnhancer:
         if package_name in self._package_cache:
             return self._package_cache[package_name]
 
-        # Query apt-cache
-        code, out, _ = self._run_cmd(f"apt-cache show {package_name} 2>/dev/null | head -20")
+        # Query apt-cache - get enough lines to capture all metadata fields
+        code, out, _ = self._run_cmd(f"apt-cache show {package_name} 2>/dev/null | head -50")
         if code != 0 or not out:
+            if self.verbose:
+                self._log(f"  Could not get apt-cache info for {package_name}")
             return None
 
         metrics = PackageMetrics(name=package_name)
@@ -1155,7 +1157,13 @@ class PlanEnhancer:
                 except (ValueError, IndexError):
                     pass
             elif line.startswith('Version:'):
-                metrics.version = line.split(':')[1].strip()
+                metrics.version = line.split(':', 1)[1].strip()
+
+        # Log what we found
+        if self.verbose and (metrics.download_size_bytes > 0 or metrics.installed_size_bytes > 0):
+            dl_mb = metrics.download_size_bytes / (1024 * 1024)
+            inst_mb = metrics.installed_size_bytes / (1024 * 1024)
+            self._log(f"  {package_name}: {dl_mb:.1f} MB download, {inst_mb:.1f} MB installed")
 
         # Check if already installed
         code, _, _ = self._run_cmd(f"dpkg -s {package_name} 2>/dev/null | grep -q 'Status: install ok installed'")
