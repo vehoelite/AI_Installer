@@ -2597,18 +2597,26 @@ class AIInstallationAgent:
         if confirm_steps:
             software_name = plan.get("software_name", "the requested software")
 
+            # Get configuration details for dynamic examples
+            config = plan.get("configuration", {})
+            current_port = config.get("ports", [9443])[0] if config.get("ports") else 9443
+
             while True:
                 print(f"\n{'─'*60}")
-                print(f"💬 Before installing {software_name}, do you have any questions")
-                print(f"   or need specific changes to the default configuration?")
+                print(f"🤖 Hello! I'm your AI Install Agent.")
                 print(f"")
-                print(f"   Examples of changes you can request:")
-                print(f"   • 'change port from 9443 to 8443'")
-                print(f"   • 'use /opt/data instead of home directory'")
-                print(f"   • 'add persistent restart policy'")
-                print(f"   • 'expose on all interfaces'")
+                print(f"   Before installing {software_name}, do you have any questions")
+                print(f"   or need any changes to the default configuration?")
                 print(f"")
-                print(f"   Type 'install' or 'yes' to proceed, 'no' to cancel")
+                print(f"   Examples:")
+                print(f"   • What config flags can I set?")
+                print(f"   • Do I have port {current_port} available?")
+                print(f"   • Do I have enough disk space?")
+                print(f"   • Use /opt/data instead of home directory")
+                print(f"   • Set OPENAI_API_KEY to sk-xxx")
+                print(f"   • Expose on all network interfaces")
+                print(f"")
+                print(f"   Type 'install' to proceed, 'no' to cancel")
                 print(f"{'─'*60}")
 
                 response = input("\n🔹 Your response: ").strip()
