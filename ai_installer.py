@@ -525,6 +525,22 @@ class SystemAnalyzer:
         """Detect installed packages relevant to the installation"""
         self._log("Scanning installed packages...")
 
+        # Common packages that are frequently needed for installations
+        common_packages = [
+            "curl", "wget", "git", "gnupg", "gnupg2", "gpg",
+            "ca-certificates", "apt-transport-https", "software-properties-common",
+            "build-essential", "gcc", "g++", "make", "cmake",
+            "python3", "python3-pip", "python3-venv",
+            "docker", "docker-ce", "docker.io", "containerd.io",
+            "lsb-release", "dirmngr",
+        ]
+
+        # Check which common packages are installed
+        for pkg in common_packages:
+            code, _, _ = self._run_cmd(f"dpkg -s {pkg} 2>/dev/null | grep -q 'Status: install ok installed'")
+            if code == 0:
+                info.installed_packages.append(pkg)
+
         # Debian/Ubuntu - GPU related packages
         code, out, _ = self._run_cmd("dpkg -l 2>/dev/null | grep -iE 'rocm|amdgpu|hip|opencl|cuda|nvidia|cudnn|nccl|tensorrt' | awk '{print $2}'")
         if code == 0 and out:
@@ -539,6 +555,15 @@ class SystemAnalyzer:
         code, out, _ = self._run_cmd("conda list 2>/dev/null | grep -iE 'cuda|cudnn|pytorch|tensorflow' | awk '{print $1}'")
         if code == 0 and out:
             info.installed_packages.extend([f"conda:{p}" for p in out.split('\n') if p.strip()])
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_packages = []
+        for pkg in info.installed_packages:
+            if pkg not in seen:
+                seen.add(pkg)
+                unique_packages.append(pkg)
+        info.installed_packages = unique_packages
 
     def _detect_resources(self, info: SystemInfo):
         """Detect system resources (disk, memory)"""
@@ -770,9 +795,11 @@ and troubleshoot any issues that arise.
 IMPORTANT RULES:
 1. Always output valid JSON responses as specified
 2. Be extremely careful with system commands - prefer safe, reversible operations
-3. Always verify prerequisites before attempting installation
+3. CRITICAL: When determining prerequisite status, you MUST check the "installed_packages" list in the system information. If a package appears in that list, mark it as "installed". Do NOT guess or assume - use the actual data provided.
 4. Provide clear explanations for each step
 5. When troubleshooting, analyze error messages carefully and suggest targeted fixes
+6. For group membership changes (like adding user to docker group), note that the user will need to log out/in for changes to take effect - do NOT use 'newgrp' as it spawns a new shell and breaks automation.
+7. Use 'groupadd --force' or check if group exists before creating to avoid errors on existing groups.
 
 You have deep knowledge of:
 - Linux system administration (Ubuntu, Debian, RHEL, etc.)
@@ -790,14 +817,24 @@ You have deep knowledge of:
                             software_request: str) -> dict:
         """Analyze what's needed to install the requested software"""
 
+        # Get installed packages as a clear list for the prompt
+        installed_pkgs = system_info.installed_packages if hasattr(system_info, 'installed_packages') else []
+
         prompt = f"""
 Analyze the following system and determine what's needed to install the requested software.
 
 SYSTEM INFORMATION:
 {json.dumps(system_info.to_dict(), indent=2)}
 
+ALREADY INSTALLED PACKAGES (use this to determine prerequisite status):
+{json.dumps(installed_pkgs, indent=2)}
+
 SOFTWARE REQUEST:
 {software_request}
+
+IMPORTANT: When filling out "prerequisites", check the ALREADY INSTALLED PACKAGES list above.
+- If a package (like "curl", "gnupg", "gnupg2", "git", etc.) appears in that list, set status to "installed"
+- Only set status to "missing" if the package is NOT in the installed packages list
 
 Respond with a JSON object containing:
 {{
