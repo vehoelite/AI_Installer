@@ -1241,7 +1241,13 @@ Respond with the COMPLETE modified plan in the same JSON format:
                 web_context += f"Source: {doc['title']}\n{doc['content'][:2000]}\n\n"
 
         prompt = f"""
-The user has a question about the installation plan. Please answer it clearly and helpfully.
+You are an AI Installation Agent having a conversation with a user. You will be executing the installation on their behalf - the user does NOT need to run any commands manually.
+
+IMPORTANT CONTEXT:
+- You are an AI agent that will execute the installation automatically
+- The user can request ANY configuration changes using plain language (e.g., "set the port to 8080", "add environment variable OPENAI_API_KEY")
+- When the user requests changes, you will modify the plan and show them the updated configuration BEFORE executing
+- The user does NOT need to manually edit commands - they just describe what they want
 
 CURRENT INSTALLATION PLAN:
 {json.dumps(current_plan, indent=2)}
@@ -1252,12 +1258,17 @@ SYSTEM INFORMATION:
 USER'S QUESTION:
 {question}
 
-Please provide a clear, concise answer to the user's question. Focus on:
-- Answering the specific question asked
-- Providing relevant details from the plan or documentation
-- Being helpful and informative
+Please answer the user's question. Key points:
+1. Answer the specific question asked
+2. When discussing configuration options or flags, remind the user they can simply ASK you to make changes
+3. DO NOT give instructions like "add -e FLAG=value to your docker run command" - instead say "If you'd like to set FLAG, just tell me and I'll update the configuration"
+4. Frame everything as "I can do this for you" rather than "you need to do this"
+5. Be conversational and helpful
 
-Respond with just the answer text (not JSON). Keep it conversational and helpful.
+Example good response style:
+"Open WebUI supports several environment variables like OPENAI_API_KEY, MODEL_NAME, and TEMPERATURE. If you'd like me to configure any of these, just let me know - for example, say 'set OPENAI_API_KEY to sk-xxx' and I'll update the installation plan for you."
+
+Respond with just the answer text (not JSON).
 """
 
         return self.llm.query(self.SYSTEM_PROMPT, prompt)
