@@ -556,6 +556,31 @@ class SystemAnalyzer:
         if code == 0 and out:
             info.installed_packages.extend([f"conda:{p}" for p in out.split('\n') if p.strip()])
 
+        # Check for tools that might be installed as binaries (not via dpkg)
+        # These are often installed via pip, curl scripts, or standalone binaries
+        binary_tools = [
+            ("docker-compose", ["docker-compose", "docker compose"]),  # Both old and new style
+            ("kubectl", ["kubectl"]),
+            ("helm", ["helm"]),
+            ("minikube", ["minikube"]),
+            ("kind", ["kind"]),
+            ("terraform", ["terraform"]),
+            ("ansible", ["ansible"]),
+            ("node", ["node"]),
+            ("npm", ["npm"]),
+            ("yarn", ["yarn"]),
+            ("go", ["go"]),
+            ("rustc", ["rustc"]),
+            ("cargo", ["cargo"]),
+        ]
+
+        for tool_name, check_commands in binary_tools:
+            for check_cmd in check_commands:
+                code, _, _ = self._run_cmd(f"command -v {check_cmd.split()[0]} >/dev/null 2>&1")
+                if code == 0:
+                    info.installed_packages.append(tool_name)
+                    break
+
         # Remove duplicates while preserving order
         seen = set()
         unique_packages = []
