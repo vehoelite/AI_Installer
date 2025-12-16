@@ -1451,11 +1451,16 @@ class PlanEnhancer:
 
         metrics.docker_download_size_mb = docker_download_total / (1024 * 1024)
 
-        # Calculate Docker pull time
+        # Calculate Docker pull time and add to download time estimate
         docker_pull_time = metrics.docker_download_size_mb * self.DOCKER_PULL_TIME_PER_MB
 
+        # Update download time to include Docker images
+        # Docker download: size in MB * 8 bits / speed in Mbps = seconds
+        docker_download_time = (metrics.docker_download_size_mb * 8) / self.DOWNLOAD_SPEED_MBPS
+        metrics.estimated_download_time_seconds = download_time + docker_download_time
+
         # Total time in minutes
-        total_seconds = download_time + install_time + command_overhead + docker_pull_time
+        total_seconds = metrics.estimated_download_time_seconds + install_time + command_overhead
         metrics.estimated_total_time_minutes = total_seconds / 60
 
         # Add minimum time (things always take longer than expected)
