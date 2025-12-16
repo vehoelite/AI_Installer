@@ -36,7 +36,7 @@ The script is organized into 5 core components:
     - OS type, version, kernel
     - WSL detection (version 1 or 2)
     - GPU hardware & driver versions
-    - Installed packages (apt, pip)
+    - Installed packages (apt, pip, docker)
     - Disk space & memory
 
 2. LLMInterface + InstallationReasoner
@@ -79,6 +79,13 @@ The script is organized into 5 core components:
 ## Dry run (test without executing)
 ```sh
 python ai_installer.py "Install AMD ROCm 6.1 for WSL2" --dry-run
+```
+
+## Up-to-date installation using web search
+```sh
+python ai_installer.py "Install Portainer" --provider local --local-present text-generation-webui --web-search
+or
+python ai_installer.py "install portainer" --provider local --local-preset lm-studio -w
 ```
 
 ## Actual installation with OpenAI
@@ -139,6 +146,7 @@ python ai_installer.py --provider local --local-preset ollama --list-models
 
 # Features
 - 📋 System Analyze & Scanning
+- 🌐 Web Search
 - 🛡️ Dangerous Command Safety Filter
 - 📦 Docker Image Support
 - 🤖 Automatic Troubleshooter & Repair
