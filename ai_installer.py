@@ -1035,6 +1035,235 @@ Respond with a JSON object:
 
 
 # ============================================================================
+# Plan Enhancer - Calculates real metrics for installation plans
+# ============================================================================
+
+@dataclass
+class PackageMetrics:
+    """Metrics for a package from apt-cache"""
+    name: str
+    size_bytes: int = 0
+    installed_size_bytes: int = 0
+    download_size_bytes: int = 0
+    version: str = ""
+    is_installed: bool = False
+
+
+@dataclass
+class PlanMetrics:
+    """Real metrics calculated for an installation plan"""
+    total_steps: int = 0
+    total_commands: int = 0
+    packages_to_install: list = field(default_factory=list)
+    packages_already_installed: list = field(default_factory=list)
+    total_download_size_mb: float = 0.0
+    total_disk_space_mb: float = 0.0
+    estimated_download_time_seconds: float = 0.0
+    estimated_install_time_seconds: float = 0.0
+    estimated_total_time_minutes: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "total_steps": self.total_steps,
+            "total_commands": self.total_commands,
+            "packages_to_install": self.packages_to_install,
+            "packages_already_installed": self.packages_already_installed,
+            "total_download_size_mb": round(self.total_download_size_mb, 2),
+            "total_disk_space_mb": round(self.total_disk_space_mb, 2),
+            "estimated_download_time_seconds": round(self.estimated_download_time_seconds, 1),
+            "estimated_install_time_seconds": round(self.estimated_install_time_seconds, 1),
+            "estimated_total_time_minutes": round(self.estimated_total_time_minutes, 1),
+        }
+
+
+class PlanEnhancer:
+    """
+    Enhances LLM-generated plans with real metrics calculated from:
+    - Actual package sizes from apt-cache
+    - Command counts from the plan
+    - Realistic time estimates based on download and install speeds
+    """
+
+    # Estimated speeds for time calculations
+    DOWNLOAD_SPEED_MBPS = 10  # Conservative estimate (10 Mbps)
+    INSTALL_SPEED_MB_PER_SEC = 50  # ~50 MB/s for package extraction/config
+    BASE_COMMAND_TIME_SEC = 2  # Base time per command (overhead)
+    APT_UPDATE_TIME_SEC = 10  # Time for apt update
+    APT_INSTALL_OVERHEAD_SEC = 5  # Overhead per apt install command
+
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self._package_cache: dict[str, PackageMetrics] = {}
+
+    def _log(self, msg: str):
+        if self.verbose:
+            print(f"  [PlanEnhancer] {msg}")
+
+    def _run_cmd(self, cmd: str) -> tuple[int, str, str]:
+        """Run a command and return (returncode, stdout, stderr)"""
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=30
+            )
+            return result.returncode, result.stdout.strip(), result.stderr.strip()
+        except Exception as e:
+            return -1, "", str(e)
+
+    def get_package_info(self, package_name: str) -> Optional[PackageMetrics]:
+        """Get package information from apt-cache"""
+        # Check cache first
+        if package_name in self._package_cache:
+            return self._package_cache[package_name]
+
+        # Query apt-cache
+        code, out, _ = self._run_cmd(f"apt-cache show {package_name} 2>/dev/null | head -20")
+        if code != 0 or not out:
+            return None
+
+        metrics = PackageMetrics(name=package_name)
+
+        for line in out.split('\n'):
+            if line.startswith('Size:'):
+                try:
+                    metrics.download_size_bytes = int(line.split(':')[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith('Installed-Size:'):
+                try:
+                    # Installed-Size is in KB
+                    metrics.installed_size_bytes = int(line.split(':')[1].strip()) * 1024
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith('Version:'):
+                metrics.version = line.split(':')[1].strip()
+
+        # Check if already installed
+        code, _, _ = self._run_cmd(f"dpkg -s {package_name} 2>/dev/null | grep -q 'Status: install ok installed'")
+        metrics.is_installed = (code == 0)
+
+        self._package_cache[package_name] = metrics
+        return metrics
+
+    def extract_packages_from_commands(self, commands: list[str]) -> list[str]:
+        """Extract package names from apt/apt-get install commands"""
+        packages = []
+
+        for cmd in commands:
+            # Match apt-get install or apt install commands
+            # Pattern: apt-get install -y pkg1 pkg2 pkg3
+            # Pattern: apt install -y pkg1 pkg2 pkg3
+            match = re.search(r'(?:apt-get|apt)\s+install\s+(?:-\w+\s+)*(.+?)(?:\s*[;&|]|$)', cmd)
+            if match:
+                # Extract package names (filter out options like -y)
+                parts = match.group(1).split()
+                for part in parts:
+                    # Skip options and redirections
+                    if not part.startswith('-') and not part.startswith('>') and '=' not in part:
+                        # Clean package name (remove version specifiers)
+                        pkg = re.sub(r'[=<>].*', '', part)
+                        if pkg and pkg not in packages:
+                            packages.append(pkg)
+
+        return packages
+
+    def calculate_metrics(self, plan: dict) -> PlanMetrics:
+        """Calculate real metrics for an installation plan"""
+        self._log("Calculating real installation metrics...")
+
+        metrics = PlanMetrics()
+
+        # Count steps and commands
+        steps = plan.get("installation_steps", [])
+        metrics.total_steps = len(steps)
+
+        all_commands = []
+        for step in steps:
+            cmds = step.get("commands", [])
+            if isinstance(cmds, str):
+                cmds = [cmds]
+            all_commands.extend(cmds)
+
+        metrics.total_commands = len(all_commands)
+
+        # Extract packages from commands
+        all_packages = self.extract_packages_from_commands(all_commands)
+        self._log(f"Found {len(all_packages)} packages in commands")
+
+        # Get info for each package
+        total_download = 0
+        total_disk = 0
+
+        for pkg_name in all_packages:
+            pkg_info = self.get_package_info(pkg_name)
+            if pkg_info:
+                if pkg_info.is_installed:
+                    metrics.packages_already_installed.append(pkg_name)
+                else:
+                    metrics.packages_to_install.append(pkg_name)
+                    total_download += pkg_info.download_size_bytes
+                    total_disk += pkg_info.installed_size_bytes
+
+        # Convert to MB
+        metrics.total_download_size_mb = total_download / (1024 * 1024)
+        metrics.total_disk_space_mb = total_disk / (1024 * 1024)
+
+        # Calculate time estimates
+        # Download time: size / speed
+        download_time = (metrics.total_download_size_mb * 8) / self.DOWNLOAD_SPEED_MBPS
+        metrics.estimated_download_time_seconds = download_time
+
+        # Install time: size / install speed + command overhead
+        install_time = metrics.total_disk_space_mb / self.INSTALL_SPEED_MB_PER_SEC
+        metrics.estimated_install_time_seconds = install_time
+
+        # Add overhead for each command
+        command_overhead = 0
+        for cmd in all_commands:
+            command_overhead += self.BASE_COMMAND_TIME_SEC
+            if 'apt-get update' in cmd or 'apt update' in cmd:
+                command_overhead += self.APT_UPDATE_TIME_SEC
+            if 'apt-get install' in cmd or 'apt install' in cmd:
+                command_overhead += self.APT_INSTALL_OVERHEAD_SEC
+
+        # Total time in minutes
+        total_seconds = download_time + install_time + command_overhead
+        metrics.estimated_total_time_minutes = total_seconds / 60
+
+        # Add minimum time (things always take longer than expected)
+        if metrics.estimated_total_time_minutes < 1:
+            metrics.estimated_total_time_minutes = 1
+
+        self._log(f"Download: {metrics.total_download_size_mb:.1f} MB, "
+                  f"Disk: {metrics.total_disk_space_mb:.1f} MB, "
+                  f"Time: ~{metrics.estimated_total_time_minutes:.1f} min")
+
+        return metrics
+
+    def enhance_plan(self, plan: dict) -> dict:
+        """Enhance a plan with real metrics, replacing LLM estimates"""
+        metrics = self.calculate_metrics(plan)
+
+        # Update plan with real values
+        enhanced = plan.copy()
+        enhanced["_real_metrics"] = metrics.to_dict()
+
+        # Replace LLM estimates with real calculations
+        enhanced["estimated_time_minutes"] = max(1, round(metrics.estimated_total_time_minutes))
+        enhanced["disk_space_required_gb"] = round(metrics.total_disk_space_mb / 1024, 2)
+
+        # Add detailed breakdown
+        enhanced["_metrics_breakdown"] = {
+            "download_size_mb": round(metrics.total_download_size_mb, 2),
+            "disk_space_mb": round(metrics.total_disk_space_mb, 2),
+            "packages_to_install": len(metrics.packages_to_install),
+            "packages_already_installed": len(metrics.packages_already_installed),
+            "total_commands": metrics.total_commands,
+        }
+
+        return enhanced, metrics
+
+
+# ============================================================================
 # Command Executor - Safely executes installation commands
 # ============================================================================
 
@@ -1416,6 +1645,7 @@ class AIInstallationAgent:
         self.analyzer = SystemAnalyzer(verbose=config.verbose)
         self.executor = CommandExecutor(dry_run=config.dry_run, verbose=config.verbose)
         self.test_runner = TestRunner(self.executor, verbose=config.verbose)
+        self.plan_enhancer = PlanEnhancer(verbose=config.verbose)
 
         # Initialize LLM
         if config.llm_provider == LLMProvider.ANTHROPIC:
@@ -1535,11 +1765,37 @@ class AIInstallationAgent:
                 "phase": "compatibility_check"
             }
 
-        # Show plan summary
+        # Enhance plan with real metrics
+        print("Calculating real installation metrics...")
+        plan, real_metrics = self.plan_enhancer.enhance_plan(plan)
+
+        # Show plan summary with real metrics
         print(f"\n📋 Installation Plan:")
-        print(f"   Estimated time: {plan.get('estimated_time_minutes', '?')} minutes")
-        print(f"   Disk space needed: {plan.get('disk_space_required_gb', '?')} GB")
-        print(f"   Steps: {len(plan.get('installation_steps', []))}")
+        print(f"   Steps: {real_metrics.total_steps}")
+        print(f"   Total commands: {real_metrics.total_commands}")
+
+        # Show package breakdown
+        if real_metrics.packages_to_install:
+            print(f"\n📦 Packages to install: {len(real_metrics.packages_to_install)}")
+            # Show first 10 packages, truncate if more
+            display_pkgs = real_metrics.packages_to_install[:10]
+            for pkg in display_pkgs:
+                print(f"      • {pkg}")
+            if len(real_metrics.packages_to_install) > 10:
+                print(f"      ... and {len(real_metrics.packages_to_install) - 10} more")
+
+        if real_metrics.packages_already_installed:
+            print(f"   ✓ Already installed: {len(real_metrics.packages_already_installed)} packages")
+
+        # Show real size and time estimates
+        print(f"\n📊 Resource Requirements (calculated from apt-cache):")
+        print(f"   Download size: {real_metrics.total_download_size_mb:.1f} MB")
+        print(f"   Disk space needed: {real_metrics.total_disk_space_mb:.1f} MB ({real_metrics.total_disk_space_mb/1024:.2f} GB)")
+
+        print(f"\n⏱️  Time Estimates:")
+        print(f"   Download time: ~{real_metrics.estimated_download_time_seconds:.0f} seconds (at 10 Mbps)")
+        print(f"   Install time: ~{real_metrics.estimated_install_time_seconds:.0f} seconds")
+        print(f"   Total estimated: ~{real_metrics.estimated_total_time_minutes:.1f} minutes")
 
         if plan.get("warnings"):
             print("\n⚠️  Warnings:")
@@ -1700,6 +1956,7 @@ class AIInstallationAgent:
             "test_results": test_results,
             "system_info": self.system_info.to_dict(),
             "pending_user_actions": self.executor.pending_user_actions,
+            "real_metrics": real_metrics.to_dict(),
             "phase": "complete"
         }
 
