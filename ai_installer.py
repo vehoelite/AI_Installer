@@ -1208,9 +1208,14 @@ Respond with the COMPLETE modified plan in the same JSON format:
     "installation_steps": [
         {{"step": 1, "description": "...", "commands": ["cmd1", "cmd2"], "requires_sudo": true/false, "risk_level": "low|medium|high"}}
     ],
+    "configuration": {{
+        "ports": ["list of ports - UPDATE this if user changed ports"],
+        "data_directory": "primary data directory path - UPDATE this if user changed directories",
+        "config_files": ["list of config file paths if any"]
+    }},
     "estimated_time_minutes": 10,
     "disk_space_required_gb": 5,
-    "warnings": ["any important warnings"],
+    "warnings": ["any important warnings - UPDATE if port/path changes affect warnings"],
     "post_install_tests": [
         {{"name": "test name", "command": "test command", "expected_output_contains": "success string"}}
     ],
@@ -1220,6 +1225,42 @@ Respond with the COMPLETE modified plan in the same JSON format:
 
         response = self.llm.query(self.SYSTEM_PROMPT, prompt)
         return self._parse_json_response(response)
+
+    def answer_question(self,
+                       question: str,
+                       current_plan: dict,
+                       system_info: SystemInfo,
+                       web_docs: Optional[dict] = None) -> str:
+        """Answer a user's question about the installation plan"""
+
+        # Build context from web docs if available
+        web_context = ""
+        if web_docs and web_docs.get("fetched_docs"):
+            web_context = "\n\nWEB DOCUMENTATION AVAILABLE:\n"
+            for doc in web_docs["fetched_docs"][:2]:
+                web_context += f"Source: {doc['title']}\n{doc['content'][:2000]}\n\n"
+
+        prompt = f"""
+The user has a question about the installation plan. Please answer it clearly and helpfully.
+
+CURRENT INSTALLATION PLAN:
+{json.dumps(current_plan, indent=2)}
+
+SYSTEM INFORMATION:
+{json.dumps(system_info.to_dict(), indent=2)}
+{web_context}
+USER'S QUESTION:
+{question}
+
+Please provide a clear, concise answer to the user's question. Focus on:
+- Answering the specific question asked
+- Providing relevant details from the plan or documentation
+- Being helpful and informative
+
+Respond with just the answer text (not JSON). Keep it conversational and helpful.
+"""
+
+        return self.llm.query(self.SYSTEM_PROMPT, prompt)
 
     def troubleshoot(self,
                     system_info: SystemInfo,
@@ -1592,7 +1633,14 @@ class PlanEnhancer:
         """Extract Docker image names from docker pull/run/compose commands"""
         images = []
 
-        for cmd in commands:
+        # First, join commands that might be split across lines (continuation lines)
+        # Join all commands into one string, then re-process
+        full_command_text = ' '.join(commands)
+
+        # Also process each individual command
+        all_text_to_scan = [full_command_text] + commands
+
+        for cmd in all_text_to_scan:
             # Match docker pull commands
             # Pattern: docker pull nginx:latest
             # Pattern: sudo docker pull nginx
@@ -1614,7 +1662,7 @@ class PlanEnhancer:
             # Pattern: docker run -d nginx:latest
             # Pattern: docker run -d --name foo nginx
             # Pattern: docker run -d -p 8080:80 --name webserver nginx:alpine
-            run_match = re.search(r'docker\s+run\s+(.+)', cmd)
+            run_match = re.search(r'docker\s+run\s+(.+)', cmd, re.DOTALL)
             if run_match:
                 # Parse the run command to find the image (last non-option argument before any command)
                 run_args = run_match.group(1)
@@ -1646,6 +1694,24 @@ class PlanEnhancer:
                             self._log(f"  Found docker image (run): {part}")
                     break
 
+            # Also scan for Docker image patterns anywhere in the command
+            # This catches images like ghcr.io/user/repo:tag, docker.io/library/nginx, etc.
+            # Pattern: registry.domain/namespace/image:tag or namespace/image:tag
+            image_patterns = [
+                r'(ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+(?::[a-z0-9._-]+)?)',  # GitHub Container Registry
+                r'(docker\.io/[a-z0-9._-]+/[a-z0-9._-]+(?::[a-z0-9._-]+)?)',  # Docker Hub explicit
+                r'(quay\.io/[a-z0-9._-]+/[a-z0-9._-]+(?::[a-z0-9._-]+)?)',  # Quay.io
+                r'([a-z0-9._-]+\.azurecr\.io/[a-z0-9._-]+(?::[a-z0-9._-]+)?)',  # Azure Container Registry
+                r'([a-z0-9._-]+\.gcr\.io/[a-z0-9._-]+(?::[a-z0-9._-]+)?)',  # Google Container Registry
+            ]
+
+            for pattern in image_patterns:
+                for match in re.findall(pattern, cmd, re.IGNORECASE):
+                    if match and match not in images:
+                        images.append(match)
+                        if self.verbose:
+                            self._log(f"  Found docker image (registry): {match}")
+
         return images
 
     def get_docker_image_size(self, image: str) -> Optional[DockerImageMetrics]:
@@ -1674,32 +1740,54 @@ class PlanEnhancer:
                 multipliers = {'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
                 metrics.compressed_size_bytes = int(size_val * multipliers.get(unit, 1))
 
-        # If not pulled locally, try Docker Hub API
+        # If not pulled locally, try to get size from registry API
         if not metrics.is_pulled or metrics.compressed_size_bytes == 0:
             try:
                 import urllib.request
                 import urllib.error
 
-                # Handle official images (no namespace)
-                if '/' not in name:
-                    namespace = 'library'
-                    repo = name
+                # Determine which registry to query based on image name
+                if name.startswith('ghcr.io/'):
+                    # GitHub Container Registry - use ghcr.io API
+                    # ghcr.io/open-webui/open-webui -> needs token, use estimate
+                    repo_path = name.replace('ghcr.io/', '')
+                    # GHCR requires authentication for size info, so we estimate based on common sizes
+                    # or try to get info via docker manifest (which also needs auth)
+                    if self.verbose:
+                        self._log(f"  GHCR image {image}: using estimated size (registry requires auth)")
+                    # Common web UI Docker images are typically 100-500MB
+                    # Provide a reasonable estimate
+                    metrics.compressed_size_bytes = 200 * 1024 * 1024  # 200 MB estimate
+                elif name.startswith('quay.io/'):
+                    # Quay.io registry
+                    if self.verbose:
+                        self._log(f"  Quay.io image {image}: using estimated size")
+                    metrics.compressed_size_bytes = 150 * 1024 * 1024  # 150 MB estimate
                 else:
-                    namespace, repo = name.split('/', 1)
+                    # Docker Hub API
+                    # Handle official images (no namespace)
+                    if '/' not in name:
+                        namespace = 'library'
+                        repo = name
+                    else:
+                        namespace, repo = name.split('/', 1)
 
-                url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags/{tag}"
-                req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+                    url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags/{tag}"
+                    req = urllib.request.Request(url, headers={'Accept': 'application/json'})
 
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-                    if 'full_size' in data:
-                        metrics.compressed_size_bytes = data['full_size']
-                        if self.verbose:
-                            size_mb = metrics.compressed_size_bytes / (1024 * 1024)
-                            self._log(f"  Docker Hub size for {image}: {size_mb:.1f} MB")
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                        if 'full_size' in data:
+                            metrics.compressed_size_bytes = data['full_size']
+                            if self.verbose:
+                                size_mb = metrics.compressed_size_bytes / (1024 * 1024)
+                                self._log(f"  Docker Hub size for {image}: {size_mb:.1f} MB")
             except Exception as e:
                 if self.verbose:
-                    self._log(f"  Could not get Docker Hub size for {image}: {e}")
+                    self._log(f"  Could not get registry size for {image}: {e}")
+                # Provide a fallback estimate for any Docker image
+                if metrics.compressed_size_bytes == 0:
+                    metrics.compressed_size_bytes = 100 * 1024 * 1024  # 100 MB fallback estimate
 
         self._docker_cache[image] = metrics
         return metrics
@@ -2523,30 +2611,69 @@ class AIInstallationAgent:
                 if response_lower in ["no", "n", "cancel", "quit", "exit"]:
                     return {"success": False, "error": "Installation cancelled by user", "phase": "confirmation"}
 
-                # Treat any other input as a modification request
+                # Detect if this is a question or a modification request
                 if response:
-                    print(f"\n🔄 Applying your changes: '{response}'")
-                    print("   Consulting AI to modify the plan...")
+                    # Check if it's a question (ends with ? or starts with question words)
+                    is_question = (
+                        response.endswith('?') or
+                        response_lower.startswith(('how ', 'what ', 'why ', 'when ', 'where ', 'which ',
+                                                    'is ', 'are ', 'can ', 'could ', 'will ', 'would ',
+                                                    'does ', 'do ', 'should ', 'tell me', 'explain'))
+                    )
 
-                    try:
-                        # Get modified plan from LLM
-                        modified_plan = self.reasoner.modify_plan(plan, response, self.system_info)
+                    if is_question:
+                        # Answer the question
+                        print(f"\n💭 Answering your question...")
 
-                        # Re-calculate metrics for the modified plan
-                        modified_plan, real_metrics = self.plan_enhancer.enhance_plan(modified_plan)
+                        try:
+                            answer = self.reasoner.answer_question(
+                                question=response,
+                                current_plan=plan,
+                                system_info=self.system_info,
+                                web_docs=web_docs
+                            )
+                            print(f"\n{'─'*60}")
+                            print(f"📖 Answer:")
+                            print(f"{'─'*60}")
+                            print(f"{answer}")
+                            print(f"{'─'*60}")
+                            input("\n   Press Enter to continue...")
+                            # Continue the loop to show the prompt again
+                            continue
 
-                        # Update the plan
-                        plan = modified_plan
+                        except Exception as e:
+                            print(f"\n❌ Failed to answer question: {e}")
+                            print("   Please try rephrasing or type 'install' to proceed.")
+                            continue
 
-                        # Show the updated plan
-                        print("\n" + "="*60)
-                        print("  📋 UPDATED PLAN")
-                        print("="*60)
-                        self._display_plan_summary(plan, real_metrics)
+                    else:
+                        # Treat as modification request
+                        print(f"\n🔄 Applying your changes: '{response}'")
+                        print("   Consulting AI to modify the plan...")
 
-                    except Exception as e:
-                        print(f"\n❌ Failed to modify plan: {e}")
-                        print("   Please try a different modification or type 'install' to proceed with current plan.")
+                        try:
+                            # Get modified plan from LLM
+                            modified_plan = self.reasoner.modify_plan(plan, response, self.system_info)
+
+                            # Preserve configuration if LLM didn't include it
+                            if not modified_plan.get("configuration") and plan.get("configuration"):
+                                modified_plan["configuration"] = plan["configuration"]
+
+                            # Re-calculate metrics for the modified plan
+                            modified_plan, real_metrics = self.plan_enhancer.enhance_plan(modified_plan)
+
+                            # Update the plan
+                            plan = modified_plan
+
+                            # Show the updated plan
+                            print("\n" + "="*60)
+                            print("  📋 UPDATED PLAN")
+                            print("="*60)
+                            self._display_plan_summary(plan, real_metrics)
+
+                        except Exception as e:
+                            print(f"\n❌ Failed to modify plan: {e}")
+                            print("   Please try a different modification or type 'install' to proceed with current plan.")
                 else:
                     print("   (No input - type 'install' to proceed or describe changes you want)")
 
