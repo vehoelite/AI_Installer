@@ -140,6 +140,7 @@ python ai_installer.py --provider local --local-preset ollama --list-models
 # Features
 - 📋 System Analyze & Scanning
 - 🛡️ Dangerous Command Safety Filter
+- 📦 Docker Image Support
 - 🤖 Automatic Troubleshooter & Repair
 
 # Prerequisites
