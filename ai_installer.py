@@ -202,6 +202,7 @@ class SystemInfo:
     environment_vars: dict = field(default_factory=dict)
     disk_space: dict = field(default_factory=dict)
     memory_info: dict = field(default_factory=dict)
+    ports_in_use: list = field(default_factory=list)  # List of ports currently in use
 
     def to_dict(self) -> dict:
         return {
@@ -227,6 +228,7 @@ class SystemInfo:
             "installed_packages": self.installed_packages[:50],  # Limit for context
             "disk_space": self.disk_space,
             "memory_info": self.memory_info,
+            "ports_in_use": self.ports_in_use[:100],  # Common ports in use
         }
 
 
@@ -276,6 +278,9 @@ class SystemAnalyzer:
 
         # System Resources
         self._detect_resources(info)
+
+        # Port Detection
+        self._detect_ports(info)
 
         return info
 
@@ -617,6 +622,55 @@ class SystemAnalyzer:
                     "used": parts[2],
                     "available": parts[6] if len(parts) > 6 else "unknown"
                 }
+
+    def _detect_ports(self, info: SystemInfo):
+        """Detect ports currently in use on the system"""
+        self._log("Scanning ports in use...")
+
+        ports = set()
+
+        # Try ss (modern) first, then netstat
+        code, out, _ = self._run_cmd("ss -tlnp 2>/dev/null | tail -n +2")
+        if code == 0 and out:
+            for line in out.split('\n'):
+                # Extract port from lines like: LISTEN 0 128 0.0.0.0:22 0.0.0.0:*
+                parts = line.split()
+                for part in parts:
+                    if ':' in part and not part.startswith('['):
+                        try:
+                            # Handle IPv4 (0.0.0.0:22) and IPv6 ([::]:22 or :::22)
+                            port_str = part.rsplit(':', 1)[-1]
+                            port = int(port_str)
+                            if 1 <= port <= 65535:
+                                ports.add(port)
+                        except (ValueError, IndexError):
+                            continue
+        else:
+            # Fallback to netstat
+            code, out, _ = self._run_cmd("netstat -tlnp 2>/dev/null | tail -n +3")
+            if code == 0 and out:
+                for line in out.split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        addr = parts[3]
+                        if ':' in addr:
+                            try:
+                                port = int(addr.rsplit(':', 1)[-1])
+                                if 1 <= port <= 65535:
+                                    ports.add(port)
+                            except (ValueError, IndexError):
+                                continue
+
+        # Also check common application ports that might be bound
+        common_ports_to_check = [80, 443, 3000, 3306, 5432, 5000, 6379, 8000, 8080, 8443, 9000, 9090, 9443, 27017]
+        for port in common_ports_to_check:
+            code, _, _ = self._run_cmd(f"ss -tlnp 2>/dev/null | grep -q ':{port} ' || netstat -tlnp 2>/dev/null | grep -q ':{port} '")
+            if code == 0:
+                ports.add(port)
+
+        info.ports_in_use = sorted(list(ports))
+        if self.verbose and ports:
+            self._log(f"Found {len(ports)} ports in use: {', '.join(map(str, sorted(ports)[:10]))}{'...' if len(ports) > 10 else ''}")
 
 
 # ============================================================================
@@ -1091,6 +1145,63 @@ Respond with a JSON object containing:
 {{
     "compatible": true/false,
     "compatibility_issues": ["list of blocking issues if not compatible"],
+    "software_name": "Human-readable name of the software being installed (e.g., 'Portainer', 'Nginx', 'PostgreSQL')",
+    "prerequisites": [
+        {{"name": "...", "status": "installed|missing|outdated", "required_version": "...", "current_version": "..."}}
+    ],
+    "installation_steps": [
+        {{"step": 1, "description": "...", "commands": ["cmd1", "cmd2"], "requires_sudo": true/false, "risk_level": "low|medium|high"}}
+    ],
+    "configuration": {{
+        "ports": ["list of ports this software will use, e.g., 9443, 8080"],
+        "data_directory": "primary data directory path",
+        "config_files": ["list of config file paths if any"]
+    }},
+    "estimated_time_minutes": 10,
+    "disk_space_required_gb": 5,
+    "warnings": ["any important warnings"],
+    "post_install_tests": [
+        {{"name": "test name", "command": "test command", "expected_output_contains": "success string"}}
+    ]
+}}
+
+Be thorough and precise. Include all necessary steps for a complete installation.
+"""
+
+        response = self.llm.query(self.SYSTEM_PROMPT, prompt)
+        return self._parse_json_response(response)
+
+    def modify_plan(self,
+                   current_plan: dict,
+                   user_request: str,
+                   system_info: SystemInfo) -> dict:
+        """Modify an installation plan based on user customization request"""
+
+        prompt = f"""
+The user wants to modify the installation plan. Apply their requested changes.
+
+CURRENT PLAN:
+{json.dumps(current_plan, indent=2)}
+
+SYSTEM INFORMATION:
+{json.dumps(system_info.to_dict(), indent=2)}
+
+USER'S MODIFICATION REQUEST:
+{user_request}
+
+IMPORTANT:
+- Apply the user's requested changes to the plan
+- Keep all other aspects of the plan unchanged unless they conflict
+- If the user asks to change a port, update ALL references to that port in commands
+- If the user asks to change a directory/path, update ALL references to that path
+- If the user's request is unclear, make a reasonable interpretation
+- Ensure commands remain valid after modifications
+
+Respond with the COMPLETE modified plan in the same JSON format:
+{{
+    "compatible": true/false,
+    "compatibility_issues": ["list of blocking issues if not compatible"],
+    "software_name": "Name of the software being installed",
     "prerequisites": [
         {{"name": "...", "status": "installed|missing|outdated", "required_version": "...", "current_version": "..."}}
     ],
@@ -1102,10 +1213,9 @@ Respond with a JSON object containing:
     "warnings": ["any important warnings"],
     "post_install_tests": [
         {{"name": "test name", "command": "test command", "expected_output_contains": "success string"}}
-    ]
+    ],
+    "modifications_made": ["list of changes applied based on user request"]
 }}
-
-Be thorough and precise. Include all necessary steps for a complete installation.
 """
 
         response = self.llm.query(self.SYSTEM_PROMPT, prompt)
@@ -2137,6 +2247,147 @@ class AIInstallationAgent:
     def _print_section(self, msg: str):
         print(f"\n--- {msg} ---\n")
 
+    def _extract_ports_from_plan(self, plan: dict) -> list[int]:
+        """Extract port numbers from installation commands"""
+        ports = set()
+
+        # Check configuration section if present
+        config = plan.get("configuration", {})
+        for port in config.get("ports", []):
+            try:
+                ports.add(int(port))
+            except (ValueError, TypeError):
+                pass
+
+        # Also scan commands for -p port mappings
+        for step in plan.get("installation_steps", []):
+            for cmd in step.get("commands", []):
+                if isinstance(cmd, str):
+                    # Match docker -p HOST:CONTAINER patterns
+                    port_matches = re.findall(r'-p\s+(\d+):', cmd)
+                    for p in port_matches:
+                        try:
+                            ports.add(int(p))
+                        except ValueError:
+                            pass
+                    # Match --publish patterns
+                    port_matches = re.findall(r'--publish[=\s]+(\d+):', cmd)
+                    for p in port_matches:
+                        try:
+                            ports.add(int(p))
+                        except ValueError:
+                            pass
+
+        return sorted(list(ports))
+
+    def _check_port_conflicts(self, plan: dict) -> list[dict]:
+        """Check if planned ports conflict with ports already in use"""
+        conflicts = []
+        planned_ports = self._extract_ports_from_plan(plan)
+        ports_in_use = self.system_info.ports_in_use if self.system_info else []
+
+        for port in planned_ports:
+            if port in ports_in_use:
+                conflicts.append({
+                    "port": port,
+                    "message": f"Port {port} is already in use on this system"
+                })
+
+        return conflicts
+
+    def _display_plan_summary(self, plan: dict, real_metrics, show_config: bool = True):
+        """Display installation plan summary"""
+        software_name = plan.get("software_name", "the requested software")
+
+        print(f"\n📋 Installation Plan for {software_name}:")
+        print(f"   Steps: {real_metrics.total_steps}")
+        print(f"   Total commands: {real_metrics.total_commands}")
+
+        # Show configuration details
+        config = plan.get("configuration", {})
+        if show_config and config:
+            print(f"\n⚙️  Configuration:")
+            if config.get("ports"):
+                print(f"   Ports: {', '.join(map(str, config['ports']))}")
+            if config.get("data_directory"):
+                print(f"   Data directory: {config['data_directory']}")
+
+        # Show package breakdown
+        if real_metrics.packages_to_install:
+            print(f"\n📦 Packages to install: {len(real_metrics.packages_to_install)}")
+            display_pkgs = real_metrics.packages_to_install[:10]
+            for pkg in display_pkgs:
+                print(f"      • {pkg}")
+            if len(real_metrics.packages_to_install) > 10:
+                print(f"      ... and {len(real_metrics.packages_to_install) - 10} more")
+
+        if real_metrics.packages_already_installed:
+            print(f"   ✓ Already installed: {len(real_metrics.packages_already_installed)} packages")
+
+        # Show Docker images breakdown
+        if real_metrics.docker_images_to_pull:
+            print(f"\n🐳 Docker images to pull: {len(real_metrics.docker_images_to_pull)}")
+            for img in real_metrics.docker_images_to_pull[:10]:
+                print(f"      • {img}")
+            if len(real_metrics.docker_images_to_pull) > 10:
+                print(f"      ... and {len(real_metrics.docker_images_to_pull) - 10} more")
+
+        if real_metrics.docker_images_already_pulled:
+            print(f"   ✓ Already pulled: {len(real_metrics.docker_images_already_pulled)} images")
+
+        # Show real size and time estimates
+        has_apt = real_metrics.packages_to_install or real_metrics.total_download_size_mb > 0
+        has_docker = real_metrics.docker_images_to_pull or real_metrics.docker_download_size_mb > 0
+
+        if has_apt or has_docker:
+            print(f"\n📊 Resource Requirements:")
+            if has_apt:
+                print(f"   APT packages:")
+                print(f"      Download size: {real_metrics.total_download_size_mb:.1f} MB")
+                print(f"      Disk space needed: {real_metrics.total_disk_space_mb:.1f} MB ({real_metrics.total_disk_space_mb/1024:.2f} GB)")
+            if has_docker:
+                print(f"   Docker images:")
+                print(f"      Download size: {real_metrics.docker_download_size_mb:.1f} MB (compressed)")
+            if has_apt and has_docker:
+                total_download = real_metrics.total_download_size_mb + real_metrics.docker_download_size_mb
+                print(f"   Total download: {total_download:.1f} MB")
+        else:
+            print(f"\n📊 Resource Requirements:")
+            print(f"   ⚠️  No apt packages or Docker images detected in commands")
+            print(f"   This installation may use other methods (snap, pip, binary downloads, etc.)")
+            print(f"   Size estimates not available")
+
+        print(f"\n⏱️  Time Estimates:")
+        print(f"   Download time: ~{real_metrics.estimated_download_time_seconds:.0f} seconds (at 10 Mbps)")
+        print(f"   Install time: ~{real_metrics.estimated_install_time_seconds:.0f} seconds")
+        print(f"   Total estimated: ~{real_metrics.estimated_total_time_minutes:.1f} minutes")
+
+        # Check for port conflicts
+        port_conflicts = self._check_port_conflicts(plan)
+        if port_conflicts:
+            print(f"\n🚫 Port Conflicts Detected:")
+            for conflict in port_conflicts:
+                print(f"   ⚠️  {conflict['message']}")
+            print(f"   💡 You can change ports by typing a request like 'change port to 9444'")
+
+        if plan.get("warnings"):
+            print("\n⚠️  Warnings:")
+            for warning in plan["warnings"]:
+                print(f"   • {warning}")
+
+        # Show modifications if this is a modified plan
+        if plan.get("modifications_made"):
+            print("\n✏️  Modifications applied:")
+            for mod in plan["modifications_made"]:
+                print(f"   • {mod}")
+
+        # Show prerequisites
+        if plan.get("prerequisites"):
+            print("\n📦 Prerequisites:")
+            for prereq in plan["prerequisites"]:
+                status_icon = "✅" if prereq.get("status") == "installed" else "❌"
+                print(f"   {status_icon} {prereq['name']}: {prereq.get('status', 'unknown')}")
+
     def install(self, software_request: str,
                 confirm_steps: bool = True,
                 on_step_complete: Optional[Callable] = None) -> dict:
@@ -2240,80 +2491,64 @@ class AIInstallationAgent:
         print("Calculating real installation metrics...")
         plan, real_metrics = self.plan_enhancer.enhance_plan(plan)
 
-        # Show plan summary with real metrics
-        print(f"\n📋 Installation Plan:")
-        print(f"   Steps: {real_metrics.total_steps}")
-        print(f"   Total commands: {real_metrics.total_commands}")
+        # Display the plan summary
+        self._display_plan_summary(plan, real_metrics)
 
-        # Show package breakdown
-        if real_metrics.packages_to_install:
-            print(f"\n📦 Packages to install: {len(real_metrics.packages_to_install)}")
-            # Show first 10 packages, truncate if more
-            display_pkgs = real_metrics.packages_to_install[:10]
-            for pkg in display_pkgs:
-                print(f"      • {pkg}")
-            if len(real_metrics.packages_to_install) > 10:
-                print(f"      ... and {len(real_metrics.packages_to_install) - 10} more")
-
-        if real_metrics.packages_already_installed:
-            print(f"   ✓ Already installed: {len(real_metrics.packages_already_installed)} packages")
-
-        # Show Docker images breakdown
-        if real_metrics.docker_images_to_pull:
-            print(f"\n🐳 Docker images to pull: {len(real_metrics.docker_images_to_pull)}")
-            for img in real_metrics.docker_images_to_pull[:10]:
-                print(f"      • {img}")
-            if len(real_metrics.docker_images_to_pull) > 10:
-                print(f"      ... and {len(real_metrics.docker_images_to_pull) - 10} more")
-
-        if real_metrics.docker_images_already_pulled:
-            print(f"   ✓ Already pulled: {len(real_metrics.docker_images_already_pulled)} images")
-
-        # Show real size and time estimates
-        has_apt = real_metrics.packages_to_install or real_metrics.total_download_size_mb > 0
-        has_docker = real_metrics.docker_images_to_pull or real_metrics.docker_download_size_mb > 0
-
-        if has_apt or has_docker:
-            print(f"\n📊 Resource Requirements:")
-            if has_apt:
-                print(f"   APT packages:")
-                print(f"      Download size: {real_metrics.total_download_size_mb:.1f} MB")
-                print(f"      Disk space needed: {real_metrics.total_disk_space_mb:.1f} MB ({real_metrics.total_disk_space_mb/1024:.2f} GB)")
-            if has_docker:
-                print(f"   Docker images:")
-                print(f"      Download size: {real_metrics.docker_download_size_mb:.1f} MB (compressed)")
-            if has_apt and has_docker:
-                total_download = real_metrics.total_download_size_mb + real_metrics.docker_download_size_mb
-                print(f"   Total download: {total_download:.1f} MB")
-        else:
-            # No apt packages or Docker images detected
-            print(f"\n📊 Resource Requirements:")
-            print(f"   ⚠️  No apt packages or Docker images detected in commands")
-            print(f"   This installation may use other methods (snap, pip, binary downloads, etc.)")
-            print(f"   Size estimates not available")
-
-        print(f"\n⏱️  Time Estimates:")
-        print(f"   Download time: ~{real_metrics.estimated_download_time_seconds:.0f} seconds (at 10 Mbps)")
-        print(f"   Install time: ~{real_metrics.estimated_install_time_seconds:.0f} seconds")
-        print(f"   Total estimated: ~{real_metrics.estimated_total_time_minutes:.1f} minutes")
-
-        if plan.get("warnings"):
-            print("\n⚠️  Warnings:")
-            for warning in plan["warnings"]:
-                print(f"   • {warning}")
-
-        # Show prerequisites
-        if plan.get("prerequisites"):
-            print("\n📦 Prerequisites:")
-            for prereq in plan["prerequisites"]:
-                status_icon = "✅" if prereq["status"] == "installed" else "❌"
-                print(f"   {status_icon} {prereq['name']}: {prereq['status']}")
-
-        # Confirm to proceed
+        # Interactive customization loop
         if confirm_steps:
-            response = input("\n🔹 Proceed with installation? (yes/no): ").lower().strip()
-            if response not in ["yes", "y"]:
-                return {"success": False, "error": "Installation cancelled by user", "phase": "confirmation"}
+            software_name = plan.get("software_name", "the requested software")
+
+            while True:
+                print(f"\n{'─'*60}")
+                print(f"💬 Before installing {software_name}, do you have any questions")
+                print(f"   or need specific changes to the default configuration?")
+                print(f"")
+                print(f"   Examples of changes you can request:")
+                print(f"   • 'change port from 9443 to 8443'")
+                print(f"   • 'use /opt/data instead of home directory'")
+                print(f"   • 'add persistent restart policy'")
+                print(f"   • 'expose on all interfaces'")
+                print(f"")
+                print(f"   Type 'install' or 'yes' to proceed, 'no' to cancel")
+                print(f"{'─'*60}")
+
+                response = input("\n🔹 Your response: ").strip()
+                response_lower = response.lower()
+
+                # Check for install/proceed
+                if response_lower in ["install", "yes", "y", "proceed", "go"]:
+                    break
+
+                # Check for cancel
+                if response_lower in ["no", "n", "cancel", "quit", "exit"]:
+                    return {"success": False, "error": "Installation cancelled by user", "phase": "confirmation"}
+
+                # Treat any other input as a modification request
+                if response:
+                    print(f"\n🔄 Applying your changes: '{response}'")
+                    print("   Consulting AI to modify the plan...")
+
+                    try:
+                        # Get modified plan from LLM
+                        modified_plan = self.reasoner.modify_plan(plan, response, self.system_info)
+
+                        # Re-calculate metrics for the modified plan
+                        modified_plan, real_metrics = self.plan_enhancer.enhance_plan(modified_plan)
+
+                        # Update the plan
+                        plan = modified_plan
+
+                        # Show the updated plan
+                        print("\n" + "="*60)
+                        print("  📋 UPDATED PLAN")
+                        print("="*60)
+                        self._display_plan_summary(plan, real_metrics)
+
+                    except Exception as e:
+                        print(f"\n❌ Failed to modify plan: {e}")
+                        print("   Please try a different modification or type 'install' to proceed with current plan.")
+                else:
+                    print("   (No input - type 'install' to proceed or describe changes you want)")
 
         # Phase 3: Execute Installation
         self._print_section("Phase 3: Executing Installation")
