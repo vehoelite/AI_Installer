@@ -1050,6 +1050,15 @@ class PackageMetrics:
 
 
 @dataclass
+class DockerImageMetrics:
+    """Metrics for a Docker image"""
+    image: str  # Full image name (e.g., "nginx:latest")
+    compressed_size_bytes: int = 0
+    tag: str = "latest"
+    is_pulled: bool = False
+
+
+@dataclass
 class PlanMetrics:
     """Real metrics calculated for an installation plan"""
     total_steps: int = 0
@@ -1061,6 +1070,10 @@ class PlanMetrics:
     estimated_download_time_seconds: float = 0.0
     estimated_install_time_seconds: float = 0.0
     estimated_total_time_minutes: float = 0.0
+    # Docker metrics
+    docker_images_to_pull: list = field(default_factory=list)
+    docker_images_already_pulled: list = field(default_factory=list)
+    docker_download_size_mb: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -1073,6 +1086,9 @@ class PlanMetrics:
             "estimated_download_time_seconds": round(self.estimated_download_time_seconds, 1),
             "estimated_install_time_seconds": round(self.estimated_install_time_seconds, 1),
             "estimated_total_time_minutes": round(self.estimated_total_time_minutes, 1),
+            "docker_images_to_pull": self.docker_images_to_pull,
+            "docker_images_already_pulled": self.docker_images_already_pulled,
+            "docker_download_size_mb": round(self.docker_download_size_mb, 2),
         }
 
 
@@ -1091,9 +1107,13 @@ class PlanEnhancer:
     APT_UPDATE_TIME_SEC = 10  # Time for apt update
     APT_INSTALL_OVERHEAD_SEC = 5  # Overhead per apt install command
 
+    # Docker image pull time estimate (seconds per MB at 10 Mbps)
+    DOCKER_PULL_TIME_PER_MB = 0.8
+
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self._package_cache: dict[str, PackageMetrics] = {}
+        self._docker_cache: dict[str, DockerImageMetrics] = {}
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1149,22 +1169,171 @@ class PlanEnhancer:
         packages = []
 
         for cmd in commands:
+            # Debug: log what commands we're analyzing
+            if self.verbose:
+                self._log(f"Analyzing command: {cmd[:80]}{'...' if len(cmd) > 80 else ''}")
+
             # Match apt-get install or apt install commands
-            # Pattern: apt-get install -y pkg1 pkg2 pkg3
-            # Pattern: apt install -y pkg1 pkg2 pkg3
-            match = re.search(r'(?:apt-get|apt)\s+install\s+(?:-\w+\s+)*(.+?)(?:\s*[;&|]|$)', cmd)
+            # Patterns handled:
+            #   apt-get install -y pkg1 pkg2 pkg3
+            #   apt install -y pkg1 pkg2 pkg3
+            #   sudo apt-get install -y pkg1 pkg2 pkg3
+            #   sudo apt install -y pkg1 pkg2 pkg3
+            #   DEBIAN_FRONTEND=noninteractive apt-get install -y pkg1 pkg2
+            #   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg1 pkg2
+
+            # Remove common prefixes that appear before apt commands
+            cleaned_cmd = cmd
+            # Remove sudo prefix
+            cleaned_cmd = re.sub(r'^sudo\s+', '', cleaned_cmd)
+            # Remove environment variable assignments
+            cleaned_cmd = re.sub(r'^\s*\w+=[^\s]+\s+', '', cleaned_cmd)
+            # Remove sudo again if it was after env vars
+            cleaned_cmd = re.sub(r'^sudo\s+', '', cleaned_cmd)
+
+            # Now try to match apt/apt-get install
+            match = re.search(r'(?:apt-get|apt)\s+install\s+(.+?)(?:\s*[;&|]|$)', cleaned_cmd)
             if match:
-                # Extract package names (filter out options like -y)
+                # Extract package names (filter out options like -y, --no-install-recommends, etc.)
                 parts = match.group(1).split()
                 for part in parts:
-                    # Skip options and redirections
-                    if not part.startswith('-') and not part.startswith('>') and '=' not in part:
-                        # Clean package name (remove version specifiers)
-                        pkg = re.sub(r'[=<>].*', '', part)
-                        if pkg and pkg not in packages:
-                            packages.append(pkg)
+                    # Skip options (start with -)
+                    if part.startswith('-'):
+                        continue
+                    # Skip redirections
+                    if part.startswith('>') or part.startswith('<'):
+                        continue
+                    # Skip if contains = (version pinning handled separately)
+                    if '=' in part:
+                        # Extract package name before the version specifier
+                        pkg = part.split('=')[0]
+                    else:
+                        pkg = part
+
+                    # Clean and validate package name
+                    pkg = pkg.strip()
+                    if pkg and pkg not in packages and not pkg.startswith('$'):
+                        packages.append(pkg)
+                        if self.verbose:
+                            self._log(f"  Found package: {pkg}")
 
         return packages
+
+    def extract_docker_images_from_commands(self, commands: list[str]) -> list[str]:
+        """Extract Docker image names from docker pull/run/compose commands"""
+        images = []
+
+        for cmd in commands:
+            # Match docker pull commands
+            # Pattern: docker pull nginx:latest
+            # Pattern: sudo docker pull nginx
+            pull_match = re.search(r'docker\s+pull\s+([^\s;&|]+)', cmd)
+            if pull_match:
+                image = pull_match.group(1).strip()
+                if image and image not in images:
+                    images.append(image)
+                    if self.verbose:
+                        self._log(f"  Found docker image (pull): {image}")
+
+            # Match docker-compose/docker compose up commands with image references
+            # These often pull images like portainer/portainer-ce:latest
+            compose_match = re.search(r'docker[\s-]compose\s+', cmd)
+            if compose_match and self.verbose:
+                self._log(f"  Found docker-compose command (images parsed from YAML at runtime)")
+
+            # Match docker run commands
+            # Pattern: docker run -d nginx:latest
+            # Pattern: docker run -d --name foo nginx
+            # Pattern: docker run -d -p 8080:80 --name webserver nginx:alpine
+            run_match = re.search(r'docker\s+run\s+(.+)', cmd)
+            if run_match:
+                # Parse the run command to find the image (last non-option argument before any command)
+                run_args = run_match.group(1)
+                # Split and find image - it's typically the first arg that doesn't start with - and isn't a value for an option
+                parts = run_args.split()
+                skip_next = False
+                for i, part in enumerate(parts):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    # Skip options and their values
+                    if part.startswith('-'):
+                        # Options that take a value
+                        if part in ['-p', '--publish', '-v', '--volume', '-e', '--env',
+                                   '--name', '-w', '--workdir', '--network', '-u', '--user',
+                                   '--entrypoint', '-m', '--memory', '--cpus']:
+                            skip_next = True
+                        elif '=' not in part and part.startswith('--'):
+                            # Long options without = might take next arg
+                            pass
+                        continue
+                    # Skip if looks like a command (after image)
+                    if '/' not in part and ':' not in part and not re.match(r'^[a-z0-9_.-]+$', part, re.I):
+                        break
+                    # This is likely the image
+                    if part and part not in images:
+                        images.append(part)
+                        if self.verbose:
+                            self._log(f"  Found docker image (run): {part}")
+                    break
+
+        return images
+
+    def get_docker_image_size(self, image: str) -> Optional[DockerImageMetrics]:
+        """Get Docker image size from Docker Hub API or local docker"""
+        # Check cache first
+        if image in self._docker_cache:
+            return self._docker_cache[image]
+
+        # Parse image name and tag
+        if ':' in image:
+            name, tag = image.rsplit(':', 1)
+        else:
+            name, tag = image, 'latest'
+
+        metrics = DockerImageMetrics(image=image, tag=tag)
+
+        # First try to check if already pulled locally
+        code, out, _ = self._run_cmd(f"docker images --format '{{{{.Size}}}}' {image} 2>/dev/null | head -1")
+        if code == 0 and out:
+            metrics.is_pulled = True
+            # Parse size like "540MB" or "1.2GB"
+            size_match = re.match(r'([\d.]+)\s*(KB|MB|GB|TB)', out, re.I)
+            if size_match:
+                size_val = float(size_match.group(1))
+                unit = size_match.group(2).upper()
+                multipliers = {'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+                metrics.compressed_size_bytes = int(size_val * multipliers.get(unit, 1))
+
+        # If not pulled locally, try Docker Hub API
+        if not metrics.is_pulled or metrics.compressed_size_bytes == 0:
+            try:
+                import urllib.request
+                import urllib.error
+
+                # Handle official images (no namespace)
+                if '/' not in name:
+                    namespace = 'library'
+                    repo = name
+                else:
+                    namespace, repo = name.split('/', 1)
+
+                url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags/{tag}"
+                req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    if 'full_size' in data:
+                        metrics.compressed_size_bytes = data['full_size']
+                        if self.verbose:
+                            size_mb = metrics.compressed_size_bytes / (1024 * 1024)
+                            self._log(f"  Docker Hub size for {image}: {size_mb:.1f} MB")
+            except Exception as e:
+                if self.verbose:
+                    self._log(f"  Could not get Docker Hub size for {image}: {e}")
+
+        self._docker_cache[image] = metrics
+        return metrics
 
     def calculate_metrics(self, plan: dict) -> PlanMetrics:
         """Calculate real metrics for an installation plan"""
@@ -1225,15 +1394,35 @@ class PlanEnhancer:
             if 'apt-get install' in cmd or 'apt install' in cmd:
                 command_overhead += self.APT_INSTALL_OVERHEAD_SEC
 
+        # Extract and analyze Docker images
+        docker_images = self.extract_docker_images_from_commands(all_commands)
+        if docker_images:
+            self._log(f"Found {len(docker_images)} Docker images in commands")
+
+        docker_download_total = 0
+        for image in docker_images:
+            img_metrics = self.get_docker_image_size(image)
+            if img_metrics:
+                if img_metrics.is_pulled:
+                    metrics.docker_images_already_pulled.append(image)
+                else:
+                    metrics.docker_images_to_pull.append(image)
+                    docker_download_total += img_metrics.compressed_size_bytes
+
+        metrics.docker_download_size_mb = docker_download_total / (1024 * 1024)
+
+        # Calculate Docker pull time
+        docker_pull_time = metrics.docker_download_size_mb * self.DOCKER_PULL_TIME_PER_MB
+
         # Total time in minutes
-        total_seconds = download_time + install_time + command_overhead
+        total_seconds = download_time + install_time + command_overhead + docker_pull_time
         metrics.estimated_total_time_minutes = total_seconds / 60
 
         # Add minimum time (things always take longer than expected)
         if metrics.estimated_total_time_minutes < 1:
             metrics.estimated_total_time_minutes = 1
 
-        self._log(f"Download: {metrics.total_download_size_mb:.1f} MB, "
+        self._log(f"Download: {metrics.total_download_size_mb:.1f} MB (apt) + {metrics.docker_download_size_mb:.1f} MB (docker), "
                   f"Disk: {metrics.total_disk_space_mb:.1f} MB, "
                   f"Time: ~{metrics.estimated_total_time_minutes:.1f} min")
 
@@ -1257,6 +1446,9 @@ class PlanEnhancer:
             "disk_space_mb": round(metrics.total_disk_space_mb, 2),
             "packages_to_install": len(metrics.packages_to_install),
             "packages_already_installed": len(metrics.packages_already_installed),
+            "docker_images_to_pull": len(metrics.docker_images_to_pull),
+            "docker_images_already_pulled": len(metrics.docker_images_already_pulled),
+            "docker_download_size_mb": round(metrics.docker_download_size_mb, 2),
             "total_commands": metrics.total_commands,
         }
 
@@ -1787,10 +1979,39 @@ class AIInstallationAgent:
         if real_metrics.packages_already_installed:
             print(f"   ✓ Already installed: {len(real_metrics.packages_already_installed)} packages")
 
+        # Show Docker images breakdown
+        if real_metrics.docker_images_to_pull:
+            print(f"\n🐳 Docker images to pull: {len(real_metrics.docker_images_to_pull)}")
+            for img in real_metrics.docker_images_to_pull[:10]:
+                print(f"      • {img}")
+            if len(real_metrics.docker_images_to_pull) > 10:
+                print(f"      ... and {len(real_metrics.docker_images_to_pull) - 10} more")
+
+        if real_metrics.docker_images_already_pulled:
+            print(f"   ✓ Already pulled: {len(real_metrics.docker_images_already_pulled)} images")
+
         # Show real size and time estimates
-        print(f"\n📊 Resource Requirements (calculated from apt-cache):")
-        print(f"   Download size: {real_metrics.total_download_size_mb:.1f} MB")
-        print(f"   Disk space needed: {real_metrics.total_disk_space_mb:.1f} MB ({real_metrics.total_disk_space_mb/1024:.2f} GB)")
+        has_apt = real_metrics.packages_to_install or real_metrics.total_download_size_mb > 0
+        has_docker = real_metrics.docker_images_to_pull or real_metrics.docker_download_size_mb > 0
+
+        if has_apt or has_docker:
+            print(f"\n📊 Resource Requirements:")
+            if has_apt:
+                print(f"   APT packages:")
+                print(f"      Download size: {real_metrics.total_download_size_mb:.1f} MB")
+                print(f"      Disk space needed: {real_metrics.total_disk_space_mb:.1f} MB ({real_metrics.total_disk_space_mb/1024:.2f} GB)")
+            if has_docker:
+                print(f"   Docker images:")
+                print(f"      Download size: {real_metrics.docker_download_size_mb:.1f} MB (compressed)")
+            if has_apt and has_docker:
+                total_download = real_metrics.total_download_size_mb + real_metrics.docker_download_size_mb
+                print(f"   Total download: {total_download:.1f} MB")
+        else:
+            # No apt packages or Docker images detected
+            print(f"\n📊 Resource Requirements:")
+            print(f"   ⚠️  No apt packages or Docker images detected in commands")
+            print(f"   This installation may use other methods (snap, pip, binary downloads, etc.)")
+            print(f"   Size estimates not available")
 
         print(f"\n⏱️  Time Estimates:")
         print(f"   Download time: ~{real_metrics.estimated_download_time_seconds:.0f} seconds (at 10 Mbps)")
