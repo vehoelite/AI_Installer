@@ -628,6 +628,8 @@ class WorkerThread(QThread):
         dry_run = self.kwargs.get("dry_run", False)
         system_info = self.kwargs.get("system_info")
         gui_config = self.kwargs.get("gui_config")
+        custom_compose_content = self.kwargs.get("custom_compose_content")
+        custom_compose_file = self.kwargs.get("custom_compose_file")
 
         # Get settings
         confirm_each_step = gui_config.app.confirm_each_step if gui_config else False
@@ -644,6 +646,10 @@ class WorkerThread(QThread):
         executor = CommandExecutor(dry_run=dry_run, verbose=True)
         steps = plan.get("installation_steps", [])
         total_steps = len(steps)
+
+        # Track custom compose file for later use
+        self._custom_compose_content = custom_compose_content
+        self._custom_compose_source = custom_compose_file
 
         self.output.emit(f"Starting installation ({total_steps} steps)...")
         if dry_run:
@@ -749,10 +755,14 @@ class WorkerThread(QThread):
                 # Track cd commands for working directory
                 if cmd.strip().startswith("cd "):
                     new_dir = cmd.strip()[3:].strip()
+                    # Expand ~ to actual home directory path
+                    new_dir = os.path.expanduser(new_dir)
+                    # Handle absolute vs relative paths
                     if new_dir.startswith("/"):
                         current_working_dir = new_dir
                     elif current_working_dir:
-                        current_working_dir = f"{current_working_dir}/{new_dir}"
+                        # Use os.path.join for proper path handling
+                        current_working_dir = os.path.normpath(os.path.join(current_working_dir, new_dir))
                     else:
                         current_working_dir = new_dir
                     self.output.emit(f"   $ {cmd}")
@@ -762,6 +772,20 @@ class WorkerThread(QThread):
                 # Display command (truncate if too long)
                 display_cmd = cmd if len(cmd) < 100 else cmd[:97] + "..."
                 self.output.emit(f"   $ {display_cmd}")
+
+                # If this is a docker compose command and we have a custom compose file,
+                # ensure the compose file exists in the working directory
+                if ("docker compose" in cmd or "docker-compose" in cmd) and current_working_dir:
+                    if hasattr(self, '_custom_compose_content') and self._custom_compose_content:
+                        compose_path = os.path.join(current_working_dir, "docker-compose.yml")
+                        if not os.path.exists(compose_path):
+                            try:
+                                self.output.emit(f"   [*] Writing custom docker-compose.yml to {current_working_dir}")
+                                with open(compose_path, 'w') as f:
+                                    f.write(self._custom_compose_content)
+                                self.output.emit(f"   [OK] Compose file written successfully")
+                            except Exception as e:
+                                self.output.emit(f"   [WARN] Could not write compose file: {e}")
 
                 # Execute with current working directory (if supported by executor)
                 try:
@@ -775,7 +799,7 @@ class WorkerThread(QThread):
                 results.append(result)
 
                 if result.skipped:
-                    self.output.emit(f"   [SKIP] {result.skip_reason[:80]}")
+                    self.output.emit(f"   [SKIP] {result.skip_reason[:150]}")
                 elif result.success:
                     self.output.emit(f"   [OK] Completed ({result.duration_seconds:.1f}s)")
                     if result.stdout and len(result.stdout) < 200:
@@ -1184,7 +1208,7 @@ class WorkerThread(QThread):
                 return False
 
             root_cause = fix_plan.get('root_cause', 'Unknown')
-            self.output.emit(f"   [*] Root cause: {root_cause[:80]}")
+            self.output.emit(f"   [*] Root cause: {root_cause}")
 
             # Execute fix steps
             fix_steps = fix_plan.get("fix_steps", [])
@@ -1250,7 +1274,7 @@ class WorkerThread(QThread):
             return False
 
         except Exception as e:
-            self.output.emit(f"   [!] Repair error: {str(e)[:80]}")
+            self.output.emit(f"   [!] Repair error: {str(e)}")
             return False
 
     def _create_error_search_query(self, failed_cmd: str, error_msg: str, system_info) -> str:
@@ -1397,7 +1421,7 @@ class WorkerThread(QThread):
                     self.output.emit("   Could not parse repair suggestions")
                     continue
 
-                self.output.emit(f"   Analysis: {fix_plan.get('root_cause', 'Unknown')[:100]}")
+                self.output.emit(f"   Analysis: {fix_plan.get('root_cause', 'Unknown')}")
 
                 # Execute fix steps
                 fix_steps = fix_plan.get("fix_steps", [])
@@ -1406,7 +1430,8 @@ class WorkerThread(QThread):
                     for fix_step in fix_steps:
                         fix_commands = fix_step.get("commands", [])
                         for fix_cmd in fix_commands:
-                            self.output.emit(f"   $ {fix_cmd[:80]}...")
+                            display = fix_cmd if len(fix_cmd) < 120 else fix_cmd[:117] + "..."
+                            self.output.emit(f"   $ {display}")
                             fix_result = executor.execute(
                                 fix_cmd,
                                 requires_sudo=fix_step.get("requires_sudo", False)
@@ -1415,7 +1440,8 @@ class WorkerThread(QThread):
                             if fix_result.success:
                                 self.output.emit("   [OK] Repair step completed")
                             else:
-                                self.output.emit(f"   [FAIL] Repair failed: {fix_result.stderr[:100]}")
+                                err_msg = fix_result.stderr[:200] if fix_result.stderr else "Unknown error"
+                                self.output.emit(f"   [FAIL] Repair failed: {err_msg}")
 
                     # Retry the original command if suggested
                     if fix_plan.get("should_retry_original", False):
@@ -1431,10 +1457,10 @@ class WorkerThread(QThread):
                     if fix_plan.get("alternative_approaches"):
                         self.output.emit("   Alternatives:")
                         for alt in fix_plan["alternative_approaches"][:2]:
-                            self.output.emit(f"     - {alt[:80]}")
+                            self.output.emit(f"     - {alt}")
 
         except Exception as e:
-            self.output.emit(f"   Auto-repair error: {str(e)[:100]}")
+            self.output.emit(f"   Auto-repair error: {str(e)}")
 
     def _answer_question(self):
         """Answer a question about the installation plan"""
@@ -2528,18 +2554,32 @@ class MainWindow(QMainWindow):
             if config.get("data_directory"):
                 lines.append(f"  Data: {config['data_directory']}")
 
-        # Port conflict detection
-        if self.system_info and config.get("ports"):
-            listening_ports = getattr(self.system_info, 'listening_ports', [])
-            conflicting_ports = []
-            for port in config["ports"]:
-                if port in listening_ports:
-                    conflicting_ports.append(port)
-            if conflicting_ports:
-                lines.append(f"\n[!!] PORT CONFLICTS DETECTED:")
-                for port in conflicting_ports:
-                    lines.append(f"  - Port {port} is already in use!")
-                lines.append("  Consider changing ports or stopping the conflicting service.")
+        # Port conflict detection - check config ports against system ports in use
+        ports_in_use = getattr(self.system_info, 'ports_in_use', []) if self.system_info else []
+        planned_ports = config.get("ports", []) if config else []
+
+        # Also extract ports from warnings (e.g., "binds to ports 80, 8080, and 8443")
+        for warning in plan.get("warnings", []):
+            port_matches = re.findall(r'\b(\d{2,5})\b', warning)
+            for match in port_matches:
+                try:
+                    port = int(match)
+                    if 1 <= port <= 65535 and port not in planned_ports:
+                        planned_ports.append(port)
+                except ValueError:
+                    pass
+
+        # Check for conflicts
+        conflicting_ports = [port for port in planned_ports if port in ports_in_use]
+
+        if conflicting_ports:
+            lines.append(f"\n[!!] PORT CONFLICTS DETECTED:")
+            for port in conflicting_ports:
+                lines.append(f"  ⚠ Port {port} is already in use on your system!")
+                lines.append(f"    → Ask: \"change port {port} to [new port]\" OR")
+                lines.append(f"    → Ask: \"stop the service using port {port}\"")
+            lines.append("")
+            lines.append("  You must resolve these conflicts before installation can succeed.")
 
         # Resource requirements
         if metrics:
@@ -2572,16 +2612,33 @@ class MainWindow(QMainWindow):
         if steps:
             lines.append(f"\n[STEPS] ({len(steps)}):")
             for step in steps[:5]:
-                desc = step.get("description", "Unknown step")[:50]
+                desc = step.get("description", "Unknown step")
+                # Only truncate very long descriptions (over 150 chars)
+                if len(desc) > 150:
+                    desc = desc[:147] + "..."
                 lines.append(f"  {step.get('step', '?')}. {desc}")
             if len(steps) > 5:
                 lines.append(f"  ... and {len(steps) - 5} more steps")
 
-        # Warnings
+        # Warnings - filter out generic port warnings if we already checked ports
         if plan.get("warnings"):
-            lines.append("\n[!] Warnings:")
+            filtered_warnings = []
             for warning in plan["warnings"]:
-                lines.append(f"  - {warning}")
+                # Skip generic port warnings - we handle ports intelligently above
+                if any(phrase in warning.lower() for phrase in [
+                    "ensure these ports are not in use",
+                    "ports are not in use",
+                    "ports are available",
+                    "check that port",
+                    "make sure port"
+                ]):
+                    continue
+                filtered_warnings.append(warning)
+
+            if filtered_warnings:
+                lines.append("\n[!] Warnings:")
+                for warning in filtered_warnings:
+                    lines.append(f"  - {warning}")
 
         # Modifications
         if plan.get("modifications_made"):
@@ -2692,12 +2749,20 @@ class MainWindow(QMainWindow):
         self._append_output("Starting installation...")
         self.progress_bar.setValue(0)
 
+        # If user provided a custom compose file, ensure it's ready to be used
+        compose_file_path = None
+        if self.custom_compose_content and self.custom_compose_file:
+            compose_file_path = self.custom_compose_file
+            self._append_output(f"[*] Custom compose file will be used: {Path(compose_file_path).name}")
+
         self.worker = WorkerThread(
             "execute_plan",
             plan=self.current_plan,
             dry_run=self.dry_run_check.isChecked(),
             gui_config=self.config,
-            system_info=self.system_info
+            system_info=self.system_info,
+            custom_compose_content=self.custom_compose_content,
+            custom_compose_file=compose_file_path
         )
         self.worker.output.connect(self._append_output)
         self.worker.progress.connect(self.progress_bar.setValue)
