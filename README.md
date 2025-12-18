@@ -80,47 +80,47 @@ The script is organized into 5 core components:
 
 ## Dry run (test without executing)
 ```sh
-python ai_installer.py "Install AMD ROCm 6.1 for WSL2" --dry-run
+python ai_installer_cli.py "Install AMD ROCm 6.1 for WSL2" --dry-run
 ```
 
 ## Up-to-date installation using web search
 ```sh
-python ai_installer.py "Install Portainer" --provider local --local-present text-generation-webui --web-search
+python ai_installer_cli.py "Install Portainer" --provider local --local-present text-generation-webui --web-search
 or
-python ai_installer.py "install portainer" --provider local --local-preset lm-studio -w
+python ai_installer_cli.py "install portainer" --provider local --local-preset lm-studio -w
 ```
 
 ## Actual installation with OpenAI
 ```sh
-python ai_installer.py "Install CUDA 12.0" --provider openai
+python ai_installer_cli.py "Install CUDA 12.0" --provider openai
 ```
 
 ## Run the built-in ROCm example
 ```sh
-python ai_installer.py --example
+python ai_installer_cli.py --example
 ```
 
 ## No confirmation prompts (automated)
 ```sh
-python ai_installer.py "Install Docker" --no-confirm
+python ai_installer_cli.py "Install Docker" --no-confirm
 ```
 
 ## Using presets
 ```sh
-python ai_installer.py "Install Docker" --provider local --local-preset lm-studio
-python ai_installer.py "Install Docker" --provider local --local-preset ollama --model llama3.1
+python ai_installer_cli.py "Install Docker" --provider local --local-preset lm-studio
+python ai_installer_cli.py "Install Docker" --provider local --local-preset ollama --model llama3.1
 ```
 
 ## Custom server URL
 ```sh
-python ai_installer.py "Install Docker" --provider local \ 
+python ai_installer_cli.py "Install Docker" --provider local \ 
     --base-url http://192.168.1.100:8080/v1 \ 
     --model my-model
 ```
 
 ## Advanced options
 ```sh
-python ai_installer.py "Install Docker" --provider local \ 
+python ai_installer_cli.py "Install Docker" --provider local \ 
     --local-preset lm-studio \ 
     --temperature 0.5 \ 
     --max-tokens 8192 \ 
@@ -129,16 +129,17 @@ python ai_installer.py "Install Docker" --provider local \
 
 ## Test connection before running
 ```sh
-python ai_installer.py --provider local --local-preset lm-studio --test-connection
+python ai_installer_cli.py --provider local --local-preset lm-studio --test-connection
 ```
 
 ## List available models
 ```sh
-python ai_installer.py --provider local --local-preset ollama --list-models
+python ai_installer_cli.py --provider local --local-preset ollama --list-models
 ```
 
 # Compatible with the following AI Models
 - openai
+- gemini
 - anthropic
 - lm-studio
 - ollama
@@ -167,6 +168,8 @@ export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY
 python3 -m venv venv
 source venv/bin/activate
 pip install anthropic  # or openai
+if using Google Gemini
+pip install google-generativeai
 pip install PySide6
 python ai_installer_gui.py
 ```
