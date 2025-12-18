@@ -3335,6 +3335,7 @@ Examples:
   # Cloud providers
   %(prog)s "Install AMD ROCm 6.1 for WSL2"
   %(prog)s "Install CUDA toolkit 12.0" --provider openai
+  %(prog)s "Install Docker" --provider gemini --model gemini-2.0-flash
 
   # Local LLM providers (OpenAI-compatible)
   %(prog)s "Install Docker" --provider local --local-preset lm-studio
@@ -3343,6 +3344,11 @@ Examples:
 
   # Dry run (test without executing)
   %(prog)s "Install Docker and docker-compose" --dry-run
+
+Supported cloud providers:
+  anthropic - Anthropic Claude (default)
+  openai    - OpenAI GPT
+  gemini    - Google Gemini (get API key: https://makersuite.google.com/app/apikey)
 
 Supported local providers (presets):
   lm-studio      - LM Studio (default: localhost:1234)
@@ -3357,7 +3363,7 @@ Supported local providers (presets):
 
     # Provider selection
     parser.add_argument("--provider", "-p",
-                       choices=["anthropic", "openai", "local"],
+                       choices=["anthropic", "openai", "gemini", "local"],
                        default="anthropic",
                        help="LLM provider to use (default: anthropic)")
 
@@ -3501,6 +3507,32 @@ Supported local providers (presets):
             verbose=True,
             web_search=args.web_search
         )
+    elif args.provider == "gemini":
+        config = AgentConfig(
+            llm_provider=LLMProvider.GEMINI,
+            model_name=args.model or "gemini-2.0-flash",
+            dry_run=args.dry_run,
+            verbose=True,
+            web_search=args.web_search
+        )
+
+        # Handle list-models for Gemini
+        if args.list_models:
+            print("📋 Fetching available Gemini models...")
+            try:
+                llm = GeminiLLM(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "", config.model_name)
+                models = llm.list_models()
+                if models:
+                    print("Available Gemini models:")
+                    for model in models:
+                        print(f"  • {model}")
+                    return {"success": True, "models": models}
+                else:
+                    print("❌ Could not fetch models (check API key)")
+                    return {"success": False}
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                return {"success": False, "error": str(e)}
     else:  # anthropic
         config = AgentConfig(
             llm_provider=LLMProvider.ANTHROPIC,
