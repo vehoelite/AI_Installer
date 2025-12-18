@@ -754,8 +754,20 @@ class WorkerThread(QThread):
                 cmd = self._fix_shell_command(cmd, current_working_dir)
 
                 # Track cd commands for working directory
+                # Handle compound commands like "cd /path && command"
                 if cmd.strip().startswith("cd "):
-                    new_dir = cmd.strip()[3:].strip()
+                    remaining_after_cd = cmd.strip()[3:].strip()
+
+                    # Check if this is a compound command with &&
+                    if " && " in remaining_after_cd:
+                        # Split into cd path and remaining commands
+                        parts = remaining_after_cd.split(" && ", 1)
+                        new_dir = parts[0].strip()
+                        remaining_cmd = parts[1].strip() if len(parts) > 1 else None
+                    else:
+                        new_dir = remaining_after_cd
+                        remaining_cmd = None
+
                     # Expand ~ to actual home directory path
                     new_dir = os.path.expanduser(new_dir)
                     # Handle absolute vs relative paths
@@ -766,9 +778,45 @@ class WorkerThread(QThread):
                         current_working_dir = os.path.normpath(os.path.join(current_working_dir, new_dir))
                     else:
                         current_working_dir = new_dir
-                    self.output.emit(f"   $ {cmd}")
+                    self.output.emit(f"   $ cd {new_dir}")
                     self.output.emit(f"   [OK] Working directory set to: {current_working_dir}")
-                    continue  # cd is handled by tracking, not executing
+
+                    # If there's a remaining command after &&, execute it now
+                    if remaining_cmd:
+                        # Apply shell fixes to the remaining command
+                        remaining_cmd = self._fix_shell_command(remaining_cmd, current_working_dir)
+                        display_remaining = remaining_cmd if len(remaining_cmd) < 100 else remaining_cmd[:97] + "..."
+                        self.output.emit(f"   $ {display_remaining}")
+
+                        # Execute the remaining command with the new working directory
+                        try:
+                            result = executor.execute(remaining_cmd, requires_sudo=requires_sudo, cwd=current_working_dir)
+                        except TypeError:
+                            # Fallback for older CommandExecutor without cwd support
+                            if current_working_dir:
+                                remaining_cmd = f"cd {current_working_dir} && {remaining_cmd}"
+                            result = executor.execute(remaining_cmd, requires_sudo=requires_sudo)
+
+                        if result.success:
+                            if result.output:
+                                output_lines = result.output.strip().split('\n')
+                                if len(output_lines) <= 5:
+                                    for line in output_lines:
+                                        self.output.emit(f"   {line}")
+                                else:
+                                    for line in output_lines[:3]:
+                                        self.output.emit(f"   {line}")
+                                    self.output.emit(f"   ... ({len(output_lines) - 5} more lines)")
+                                    for line in output_lines[-2:]:
+                                        self.output.emit(f"   {line}")
+                            self.output.emit("   [OK] Command completed successfully")
+                        else:
+                            self.output.emit(f"   [FAIL] Exit code {result.exit_code}")
+                            if result.output:
+                                for line in result.output.strip().split('\n')[-5:]:
+                                    self.output.emit(f"   {line}")
+                            step_failed = True
+                    continue  # cd part is handled, remaining command (if any) executed
 
                 # Display command (truncate if too long)
                 display_cmd = cmd if len(cmd) < 100 else cmd[:97] + "..."
@@ -1376,9 +1424,31 @@ class WorkerThread(QThread):
                     # Apply same shell fixes
                     fix_cmd = self._fix_shell_command(fix_cmd, cwd)
 
-                    # Skip if it's just a cd command
+                    # Handle cd commands - extract remaining command if it's a compound command
                     if fix_cmd.strip().startswith("cd "):
-                        continue
+                        remaining_after_cd = fix_cmd.strip()[3:].strip()
+                        if " && " in remaining_after_cd:
+                            # Split into cd path and remaining commands
+                            parts = remaining_after_cd.split(" && ", 1)
+                            new_dir = parts[0].strip()
+                            new_dir = os.path.expanduser(new_dir)
+                            # Update cwd for subsequent commands
+                            if new_dir.startswith("/"):
+                                cwd = new_dir
+                            elif cwd:
+                                cwd = os.path.normpath(os.path.join(cwd, new_dir))
+                            else:
+                                cwd = new_dir
+                            self.output.emit(f"   $ cd {new_dir}")
+                            self.output.emit(f"   [OK] Working directory set to: {cwd}")
+                            # Use the remaining command as fix_cmd
+                            fix_cmd = parts[1].strip() if len(parts) > 1 else None
+                            if not fix_cmd:
+                                continue
+                            fix_cmd = self._fix_shell_command(fix_cmd, cwd)
+                        else:
+                            # Just a cd command, skip it
+                            continue
 
                     # Check if this fix command is equivalent to the original
                     fix_cmd_normalized = fix_cmd.strip().lower()
