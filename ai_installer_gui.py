@@ -62,7 +62,7 @@ try:
         AgentConfig, LLMProvider, OpenAICompatibleConfig,
         SystemAnalyzer, SystemInfo, InstallationReasoner,
         CommandExecutor, TestRunner, PlanEnhancer, WebSearcher,
-        AnthropicLLM, OpenAILLM, OpenAICompatibleLLM
+        AnthropicLLM, OpenAILLM, OpenAICompatibleLLM, GeminiLLM
     )
     CORE_AVAILABLE = True
 except ImportError as e:
@@ -485,6 +485,15 @@ class WorkerThread(QThread):
                 import anthropic
                 client = anthropic.Anthropic(api_key=config.llm.anthropic_api_key)
                 self.finished_signal.emit({"success": True, "message": "Anthropic API configured"})
+            elif config.llm.provider == "gemini":
+                # Test Gemini connection
+                gemini_llm = GeminiLLM(config.llm.gemini_api_key, config.llm.gemini_model)
+                models = gemini_llm.list_models()
+                self.finished_signal.emit({
+                    "success": True,
+                    "message": f"Gemini API connected ({len(models)} models available)",
+                    "models": models
+                })
             else:
                 self.finished_signal.emit({"success": True, "message": "API key configured"})
         except Exception as e:
@@ -511,6 +520,8 @@ class WorkerThread(QThread):
             return OpenAILLM(config.llm.openai_api_key, config.llm.openai_model)
         elif config.llm.provider == "anthropic":
             return AnthropicLLM(config.llm.anthropic_api_key, config.llm.anthropic_model)
+        elif config.llm.provider == "gemini":
+            return GeminiLLM(config.llm.gemini_api_key, config.llm.gemini_model)
         else:
             raise ValueError(f"Unknown LLM provider: {config.llm.provider}")
 
@@ -1715,7 +1726,7 @@ class SetupWizard(QDialog):
         provider_layout = QFormLayout(provider_group)
 
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["Local LLM (LM Studio, Ollama, etc.)", "OpenAI API", "Anthropic API"])
+        self.provider_combo.addItems(["Local LLM (LM Studio, Ollama, etc.)", "OpenAI API", "Anthropic API", "Google Gemini API"])
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         provider_layout.addRow("Provider:", self.provider_combo)
 
@@ -1787,6 +1798,26 @@ class SetupWizard(QDialog):
 
         self.settings_stack.addWidget(anthropic_widget)
 
+        # Gemini settings
+        gemini_widget = QWidget()
+        gemini_layout = QFormLayout(gemini_widget)
+
+        self.gemini_key = QLineEdit()
+        self.gemini_key.setPlaceholderText("AIza...")
+        self.gemini_key.setEchoMode(QLineEdit.Password)
+        gemini_layout.addRow("API Key:", self.gemini_key)
+
+        gemini_key_link = QLabel('<a href="https://makersuite.google.com/app/apikey">Get API Key from Google AI Studio</a>')
+        gemini_key_link.setOpenExternalLinks(True)
+        gemini_layout.addRow("", gemini_key_link)
+
+        self.gemini_model = QComboBox()
+        self.gemini_model.addItems(["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"])
+        self.gemini_model.setEditable(True)
+        gemini_layout.addRow("Model:", self.gemini_model)
+
+        self.settings_stack.addWidget(gemini_widget)
+
         layout.addWidget(self.settings_stack)
 
         # Options
@@ -1840,7 +1871,7 @@ class SetupWizard(QDialog):
         llm = self.config.llm
 
         # Set provider
-        provider_map = {"local": 0, "openai": 1, "anthropic": 2}
+        provider_map = {"local": 0, "openai": 1, "anthropic": 2, "gemini": 3}
         self.provider_combo.setCurrentIndex(provider_map.get(llm.provider, 0))
 
         # Local settings
@@ -1850,9 +1881,18 @@ class SetupWizard(QDialog):
         self.local_port.setValue(llm.local_port)
         self.local_model.setText(llm.local_model)
 
-        # API keys
+        # API keys and models
         self.openai_key.setText(llm.openai_api_key)
         self.anthropic_key.setText(llm.anthropic_api_key)
+        self.gemini_key.setText(llm.gemini_api_key)
+
+        # Set models if they differ from defaults
+        if llm.openai_model:
+            self.openai_model.setCurrentText(llm.openai_model)
+        if llm.anthropic_model:
+            self.anthropic_model.setCurrentText(llm.anthropic_model)
+        if llm.gemini_model:
+            self.gemini_model.setCurrentText(llm.gemini_model)
 
         # Options
         self.web_search_check.setChecked(self.config.app.web_search_enabled)
@@ -1901,7 +1941,7 @@ class SetupWizard(QDialog):
 
     def _save_to_config(self):
         """Save UI values to config object"""
-        providers = ["local", "openai", "anthropic"]
+        providers = ["local", "openai", "anthropic", "gemini"]
         self.config.llm.provider = providers[self.provider_combo.currentIndex()]
 
         presets = ["lm-studio", "ollama", "localai", "custom"]
@@ -1915,6 +1955,9 @@ class SetupWizard(QDialog):
 
         self.config.llm.anthropic_api_key = self.anthropic_key.text()
         self.config.llm.anthropic_model = self.anthropic_model.currentText()
+
+        self.config.llm.gemini_api_key = self.gemini_key.text()
+        self.config.llm.gemini_model = self.gemini_model.currentText()
 
         self.config.app.web_search_enabled = self.web_search_check.isChecked()
         self.config.app.verbose_output = self.verbose_check.isChecked()
