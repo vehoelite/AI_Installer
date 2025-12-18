@@ -2414,6 +2414,10 @@ class CommandExecutor:
         """
         import time
 
+        # Expand ~ in cwd path (Python subprocess doesn't expand it automatically)
+        if cwd:
+            cwd = os.path.expanduser(cwd)
+
         if requires_sudo and not command.startswith("sudo"):
             command = f"sudo {command}"
 
