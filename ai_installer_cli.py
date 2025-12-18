@@ -1039,7 +1039,7 @@ class GeminiLLM(LLMInterface):
     Install: pip install google-genai
     """
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
         self.api_key = api_key
         self.model = model
         self._client = None
@@ -1110,21 +1110,86 @@ class GeminiLLM(LLMInterface):
                 raise RuntimeError(f"Gemini query failed: {error_msg}")
 
     def list_models(self) -> list[str]:
-        """List available Gemini models"""
+        """List available Gemini models suitable for text generation"""
+        # Curated list of models appropriate for AI Installer (text generation only)
+        # Excludes: Veo (video), Imagen (image), embedding models, etc.
+        ALLOWED_MODEL_PATTERNS = [
+            "gemini-3",        # Gemini 3 Flash, Pro
+            "gemini-2.5",      # Gemini 2.5 Pro, Flash, Flash-Lite, Deep Think, Computer Use
+            "gemini-2.0",      # Gemini 2.0 Flash, Flash-Lite
+            "gemini-1.5",      # Gemini 1.5 Pro, Flash
+            "gemini-1.0",      # Gemini 1.0 Pro (legacy)
+            "gemini-pro",      # Gemini Pro (legacy naming)
+            "gemini-flash",    # Gemini Flash (legacy naming)
+        ]
+
+        # Patterns to exclude (not suitable for text generation tasks)
+        EXCLUDED_PATTERNS = [
+            "embedding",       # Embedding models
+            "veo",            # Video generation
+            "imagen",         # Image generation
+            "vision",         # Vision-only models
+            "aqa",            # Attributed QA models
+            "bisheng",        # Specialized models
+            "code-",          # Code-specific models (may not follow instructions well)
+        ]
+
         try:
             client = self._get_client()
             models = []
             for model in client.models.list():
-                # Filter for models that support content generation
                 model_name = model.name
                 if model_name.startswith("models/"):
                     model_name = model_name[7:]  # Remove "models/" prefix
-                # Only include gemini models (not embedding models, etc.)
-                if "gemini" in model_name.lower():
+
+                model_lower = model_name.lower()
+
+                # Skip excluded patterns
+                if any(excl in model_lower for excl in EXCLUDED_PATTERNS):
+                    continue
+
+                # Only include allowed Gemini text generation models
+                if any(pattern in model_lower for pattern in ALLOWED_MODEL_PATTERNS):
                     models.append(model_name)
-            return sorted(models) if models else ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+
+            # Sort with preferred models first
+            def model_priority(name):
+                name_lower = name.lower()
+                # Prioritize newer models
+                if "gemini-3" in name_lower:
+                    return (0, name)
+                elif "gemini-2.5" in name_lower:
+                    if "flash" in name_lower and "lite" not in name_lower:
+                        return (1, name)  # 2.5 Flash first
+                    elif "pro" in name_lower:
+                        return (2, name)
+                    else:
+                        return (3, name)
+                elif "gemini-2.0" in name_lower:
+                    if "flash" in name_lower and "lite" not in name_lower:
+                        return (4, name)
+                    else:
+                        return (5, name)
+                elif "gemini-1.5" in name_lower:
+                    return (6, name)
+                else:
+                    return (7, name)
+
+            models = sorted(set(models), key=model_priority)
+            return models if models else self._get_default_models()
         except Exception:
-            return ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+            return self._get_default_models()
+
+    def _get_default_models(self) -> list[str]:
+        """Return default curated model list"""
+        return [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        ]
 
 
 class OpenAICompatibleLLM(LLMInterface):
@@ -3352,7 +3417,7 @@ Examples:
   # Cloud providers
   %(prog)s "Install AMD ROCm 6.1 for WSL2"
   %(prog)s "Install CUDA toolkit 12.0" --provider openai
-  %(prog)s "Install Docker" --provider gemini --model gemini-2.0-flash
+  %(prog)s "Install Docker" --provider gemini --model gemini-2.5-flash
 
   # Local LLM providers (OpenAI-compatible)
   %(prog)s "Install Docker" --provider local --local-preset lm-studio
@@ -3527,7 +3592,7 @@ Supported local providers (presets):
     elif args.provider == "gemini":
         config = AgentConfig(
             llm_provider=LLMProvider.GEMINI,
-            model_name=args.model or "gemini-2.0-flash",
+            model_name=args.model or "gemini-2.5-flash",
             dry_run=args.dry_run,
             verbose=True,
             web_search=args.web_search
