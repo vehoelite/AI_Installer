@@ -1128,10 +1128,14 @@ class GeminiLLM(LLMInterface):
             "embedding",       # Embedding models
             "veo",            # Video generation
             "imagen",         # Image generation
+            "image",          # Image generation/processing models
             "vision",         # Vision-only models
             "aqa",            # Attributed QA models
             "bisheng",        # Specialized models
             "code-",          # Code-specific models (may not follow instructions well)
+            "tts",            # Text-to-speech models
+            "native-audio",   # Native audio models
+            "audio",          # Audio processing models
         ]
 
         try:
@@ -1183,8 +1187,11 @@ class GeminiLLM(LLMInterface):
     def _get_default_models(self) -> list[str]:
         """Return default curated model list"""
         return [
+            "gemini-3-flash-preview",
+            "gemini-3-pro-preview",
             "gemini-2.5-flash",
             "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
             "gemini-1.5-flash",
