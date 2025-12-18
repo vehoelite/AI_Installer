@@ -1816,6 +1816,21 @@ class SetupWizard(QDialog):
         self.gemini_model.setEditable(True)
         gemini_layout.addRow("Model:", self.gemini_model)
 
+        # Test connection and fetch models buttons
+        gemini_btn_layout = QHBoxLayout()
+        self.gemini_test_btn = QPushButton("Test Connection")
+        self.gemini_test_btn.setObjectName("primary")
+        self.gemini_test_btn.clicked.connect(self._test_gemini_connection)
+        gemini_btn_layout.addWidget(self.gemini_test_btn)
+
+        self.gemini_fetch_btn = QPushButton("Fetch Models")
+        self.gemini_fetch_btn.clicked.connect(self._fetch_gemini_models)
+        gemini_btn_layout.addWidget(self.gemini_fetch_btn)
+        gemini_layout.addRow("", gemini_btn_layout)
+
+        self.gemini_status = QLabel("")
+        gemini_layout.addRow("", self.gemini_status)
+
         self.settings_stack.addWidget(gemini_widget)
 
         layout.addWidget(self.settings_stack)
@@ -1938,6 +1953,122 @@ class SetupWizard(QDialog):
     def _on_test_error(self, error):
         self.test_status.setText(f"✗ Error: {error[:50]}...")
         self.test_status.setStyleSheet("color: #f38ba8;")
+
+    def _test_gemini_connection(self):
+        """Test Gemini API connection"""
+        api_key = self.gemini_key.text().strip()
+        if not api_key:
+            self.gemini_status.setText("✗ Please enter an API key first")
+            self.gemini_status.setStyleSheet("color: #f38ba8;")
+            return
+
+        self.gemini_status.setText("Testing connection...")
+        self.gemini_status.setStyleSheet("color: #f9e2af;")
+        self.gemini_test_btn.setEnabled(False)
+        self.gemini_fetch_btn.setEnabled(False)
+
+        # Run test in background thread
+        from PySide6.QtCore import QThread
+
+        def test_gemini():
+            try:
+                llm = GeminiLLM(api_key, self.gemini_model.currentText())
+                # Try a simple query to verify connection
+                models = llm.list_models()
+                return {"success": True, "models": models}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        # Use QTimer to run async-like behavior
+        from PySide6.QtCore import QTimer
+        import threading
+
+        def run_test():
+            result = test_gemini()
+            # Update UI in main thread
+            QTimer.singleShot(0, lambda: self._on_gemini_test_complete(result))
+
+        thread = threading.Thread(target=run_test)
+        thread.start()
+
+    def _on_gemini_test_complete(self, result):
+        """Handle Gemini test result"""
+        self.gemini_test_btn.setEnabled(True)
+        self.gemini_fetch_btn.setEnabled(True)
+
+        if result.get("success"):
+            models = result.get("models", [])
+            model_count = len(models) if models else 0
+            self.gemini_status.setText(f"✓ Connected! {model_count} models available")
+            self.gemini_status.setStyleSheet("color: #a6e3a1;")
+        else:
+            error = result.get("error", "Connection failed")[:60]
+            self.gemini_status.setText(f"✗ {error}")
+            self.gemini_status.setStyleSheet("color: #f38ba8;")
+
+    def _fetch_gemini_models(self):
+        """Fetch available Gemini models and populate dropdown"""
+        api_key = self.gemini_key.text().strip()
+        if not api_key:
+            self.gemini_status.setText("✗ Please enter an API key first")
+            self.gemini_status.setStyleSheet("color: #f38ba8;")
+            return
+
+        self.gemini_status.setText("Fetching models...")
+        self.gemini_status.setStyleSheet("color: #f9e2af;")
+        self.gemini_test_btn.setEnabled(False)
+        self.gemini_fetch_btn.setEnabled(False)
+
+        # Run fetch in background thread
+        from PySide6.QtCore import QTimer
+        import threading
+
+        def fetch_models():
+            try:
+                llm = GeminiLLM(api_key, "gemini-2.0-flash")
+                models = llm.list_models()
+                return {"success": True, "models": models}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        def run_fetch():
+            result = fetch_models()
+            QTimer.singleShot(0, lambda: self._on_gemini_fetch_complete(result))
+
+        thread = threading.Thread(target=run_fetch)
+        thread.start()
+
+    def _on_gemini_fetch_complete(self, result):
+        """Handle Gemini model fetch result"""
+        self.gemini_test_btn.setEnabled(True)
+        self.gemini_fetch_btn.setEnabled(True)
+
+        if result.get("success"):
+            models = result.get("models", [])
+            if models:
+                # Save current selection
+                current = self.gemini_model.currentText()
+
+                # Clear and repopulate
+                self.gemini_model.clear()
+                self.gemini_model.addItems(models)
+
+                # Restore selection if it exists
+                index = self.gemini_model.findText(current)
+                if index >= 0:
+                    self.gemini_model.setCurrentIndex(index)
+                else:
+                    self.gemini_model.setCurrentIndex(0)
+
+                self.gemini_status.setText(f"✓ Found {len(models)} models")
+                self.gemini_status.setStyleSheet("color: #a6e3a1;")
+            else:
+                self.gemini_status.setText("✗ No models found")
+                self.gemini_status.setStyleSheet("color: #f38ba8;")
+        else:
+            error = result.get("error", "Fetch failed")[:60]
+            self.gemini_status.setText(f"✗ {error}")
+            self.gemini_status.setStyleSheet("color: #f38ba8;")
 
     def _save_to_config(self):
         """Save UI values to config object"""
