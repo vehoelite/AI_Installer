@@ -876,14 +876,17 @@ class WorkerThread(QThread):
             # Show detailed test failures
             if test_results.get('failed', 0) > 0:
                 self.output.emit("\n   Failed tests:")
-                for test in test_results.get('results', []):
+                # Note: TestRunner returns 'test_results' key, not 'results'
+                for test in test_results.get('test_results', []):
                     if not test.get('passed', True):
                         test_name = test.get('name', test.get('command', 'Unknown test'))
                         self.output.emit(f"   [X] {test_name}")
                         if test.get('output'):
-                            # Show first 100 chars of output
-                            output = test['output'][:100].replace('\n', ' ')
-                            self.output.emit(f"       {output}...")
+                            # Show first 200 chars of output for better context
+                            output = test['output'][:200].replace('\n', ' ')
+                            self.output.emit(f"       Output: {output}...")
+                        if test.get('expected'):
+                            self.output.emit(f"       Expected: {test['expected']}")
 
         # Show pending user actions
         if executor.pending_user_actions:
