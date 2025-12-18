@@ -865,6 +865,9 @@ class WorkerThread(QThread):
 
         # Run post-install tests
         if not self._is_cancelled and plan.get("post_install_tests"):
+            # Wait for any Docker containers to be fully ready before testing
+            self._wait_for_containers_ready(executor, plan)
+
             self.output.emit("\n[*] Running post-installation tests...")
             test_runner = TestRunner(executor, verbose=True)
             test_results = test_runner.run_tests(plan["post_install_tests"])
@@ -1103,6 +1106,113 @@ class WorkerThread(QThread):
             return False, f"Container exited. Last logs:\n{logs[:500]}"
 
         return False, f"Container status: {status}"
+
+    def _wait_for_containers_ready(self, executor, plan: dict, timeout: int = 60):
+        """
+        Wait for Docker containers to be fully ready before running tests.
+        Extracts container names from the plan and polls their status.
+        """
+        import time
+
+        # Extract container names from the plan's commands
+        container_names = set()
+        for step in plan.get("installation_steps", []):
+            for cmd in step.get("commands", []):
+                # Look for docker run --name container_name
+                match = re.search(r'docker\s+run\s+.*--name[=\s]+([^\s]+)', cmd)
+                if match:
+                    container_names.add(match.group(1))
+                # Look for docker-compose/docker compose project names
+                if 'docker-compose' in cmd or 'docker compose' in cmd:
+                    if 'up' in cmd:
+                        # Try to find -p or --project-name
+                        match = re.search(r'(?:-p|--project-name)\s+(\S+)', cmd)
+                        if match:
+                            container_names.add(match.group(1))
+
+        # Also extract from post_install_tests that check specific containers
+        for test in plan.get("post_install_tests", []):
+            test_cmd = test.get("command", "")
+            match = re.search(r'--filter\s+name=([^\s]+)', test_cmd)
+            if match:
+                container_names.add(match.group(1))
+            # Also check for direct container name references
+            match = re.search(r'docker\s+(?:ps|logs|inspect)\s+([a-zA-Z0-9_-]+)', test_cmd)
+            if match and match.group(1) not in ['ps', '-a', '--filter']:
+                container_names.add(match.group(1))
+
+        if not container_names:
+            return  # No containers to wait for
+
+        self.output.emit(f"\n[*] Waiting for container(s) to be ready: {', '.join(container_names)}")
+
+        start_time = time.time()
+        all_ready = False
+        last_status = {}
+
+        while time.time() - start_time < timeout:
+            if self._is_cancelled:
+                self.output.emit("   [!] Cancelled while waiting for containers")
+                return
+
+            all_ready = True
+            for name in container_names:
+                try:
+                    result = executor.execute(
+                        f"docker ps --filter name={name} --format '{{{{.Status}}}}'",
+                        timeout=10
+                    )
+                    status = (result.stdout or '').strip()
+
+                    if status and 'Up' in status:
+                        if last_status.get(name) != 'ready':
+                            self.output.emit(f"   [OK] {name}: Running ({status})")
+                            last_status[name] = 'ready'
+                    elif status:
+                        all_ready = False
+                        if last_status.get(name) != status:
+                            self.output.emit(f"   [..] {name}: {status}")
+                            last_status[name] = status
+                    else:
+                        # Container might still be starting (image download, etc.)
+                        # Check if it exists but is not yet running
+                        check_result = executor.execute(
+                            f"docker ps -a --filter name={name} --format '{{{{.Status}}}}'",
+                            timeout=10
+                        )
+                        check_status = (check_result.stdout or '').strip()
+                        if check_status:
+                            all_ready = False
+                            if last_status.get(name) != check_status:
+                                self.output.emit(f"   [..] {name}: {check_status}")
+                                last_status[name] = check_status
+                        else:
+                            # Container doesn't exist yet - might still be pulling image
+                            all_ready = False
+                            if last_status.get(name) != 'waiting':
+                                self.output.emit(f"   [..] {name}: Waiting for container to start...")
+                                last_status[name] = 'waiting'
+                except Exception as e:
+                    all_ready = False
+                    if last_status.get(name) != 'error':
+                        self.output.emit(f"   [!] {name}: Error checking status - {str(e)[:50]}")
+                        last_status[name] = 'error'
+
+            if all_ready:
+                # Give containers a moment to fully initialize after "Up" status
+                time.sleep(2)
+                self.output.emit(f"   [OK] All containers ready after {time.time() - start_time:.1f}s")
+                return
+
+            # Poll every 2 seconds
+            time.sleep(2)
+
+        # Timeout reached
+        elapsed = time.time() - start_time
+        self.output.emit(f"   [!] Timeout after {elapsed:.0f}s - some containers may not be ready")
+        for name in container_names:
+            if last_status.get(name) != 'ready':
+                self.output.emit(f"       {name}: {last_status.get(name, 'unknown')}")
 
     def _fix_shell_command(self, cmd: str, cwd: str = None) -> str:
         """Fix common shell compatibility issues in commands"""
