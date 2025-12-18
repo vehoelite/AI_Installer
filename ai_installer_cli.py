@@ -2540,6 +2540,39 @@ class TestRunner:
         if self.verbose:
             print(f"  [Test] {msg}")
 
+    def _fix_test_command(self, command: str) -> str:
+        """Fix common issues with AI-generated test commands"""
+        import re
+
+        # Fix curl commands for HTTPS endpoints
+        # Many services (like NextCloud AIO) use self-signed certs
+        if 'curl' in command:
+            # Add -k flag for SSL if hitting HTTPS or common HTTPS ports
+            https_ports = ['443', '8443', '9443', '9444', '9445']
+            needs_ssl_skip = False
+
+            if 'https://' in command:
+                needs_ssl_skip = True
+            else:
+                # Check if hitting a common HTTPS port with http://
+                for port in https_ports:
+                    if f':{port}' in command and 'http://' in command:
+                        # Convert to https
+                        command = command.replace('http://', 'https://')
+                        needs_ssl_skip = True
+                        self._log(f"Converting to HTTPS for port {port}")
+                        break
+
+            if needs_ssl_skip and ' -k' not in command and ' --insecure' not in command:
+                # Add -k flag after curl
+                command = command.replace('curl ', 'curl -k ', 1)
+
+            # Add timeout to curl if not present
+            if ' --max-time' not in command and ' -m ' not in command:
+                command = command.replace('curl ', 'curl --max-time 10 ', 1)
+
+        return command
+
     def run_tests(self, tests: list[dict]) -> dict:
         """Run a list of tests and return results"""
         results = {
@@ -2551,7 +2584,13 @@ class TestRunner:
 
         for test in tests:
             self._log(f"Running: {test['name']}")
-            result = self.executor.execute(test["command"], timeout=60)
+
+            # Fix common test command issues
+            command = self._fix_test_command(test["command"])
+            if command != test["command"]:
+                self._log(f"Fixed command: {command[:80]}...")
+
+            result = self.executor.execute(command, timeout=60)
 
             # Check if output contains expected string
             expected = test.get("expected_output_contains", "")
