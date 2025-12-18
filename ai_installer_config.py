@@ -31,7 +31,7 @@ class LLMProviderSettings:
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-20250514"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
 
     # Common settings
     temperature: float = 0.7
