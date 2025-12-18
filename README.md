@@ -176,3 +176,14 @@ pip install google-genai
 pip install PySide6
 python ai_installer_gui.py
 ```
+# Coming Soon
+Pre-trained AI models dedicated to AI Installer. 
+Software Presets (if your a software designer and would like a preset, I will do Vigorous testing for your software to be guaranteed success)
+
+# Mission Statement
+My goal is to make installing software completely automated, no longer should a software designer have to deal with customers/users unable to use their software due to installation issues. No longer will a user be barred from utilizing a peice of software because he/she doesn't fully understand it. If your on the operating system it's designed for, AI Installer will make sure installation will be a success. 
+This will always be opensourced.
+Anyone can add to it as long as: 
+- #1: Bug fix
+- #2: Stays to the design theme
+- #3: Communicate any new features
