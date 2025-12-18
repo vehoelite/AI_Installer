@@ -168,7 +168,7 @@ export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY
 python3 -m venv venv
 source venv/bin/activate
 pip install anthropic  # or openai
-if using Google Gemini
+# if using Google Gemini
 pip install google-generativeai
 pip install PySide6
 python ai_installer_gui.py
