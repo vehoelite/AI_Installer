@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 class LLMProvider(Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    GEMINI = "gemini"  # Google Gemini
     OPENAI_COMPATIBLE = "openai_compatible"  # For LM Studio, Ollama, LocalAI, etc.
 
 
@@ -130,6 +131,8 @@ class AgentConfig:
                 self.api_key = os.getenv("OPENAI_API_KEY")
             elif self.llm_provider == LLMProvider.ANTHROPIC:
                 self.api_key = os.getenv("ANTHROPIC_API_KEY")
+            elif self.llm_provider == LLMProvider.GEMINI:
+                self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             elif self.llm_provider == LLMProvider.OPENAI_COMPATIBLE:
                 # Local servers typically don't need a real API key
                 self.api_key = os.getenv("LOCAL_LLM_API_KEY", "not-needed")
@@ -1024,6 +1027,87 @@ class OpenAILLM(LLMInterface):
             return response.choices[0].message.content
         except ImportError:
             raise RuntimeError("openai package not installed. Run: pip install openai")
+
+
+class GeminiLLM(LLMInterface):
+    """Google Gemini integration"""
+
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+        self.api_key = api_key
+        self.model = model
+        self._client = None
+
+    def _get_client(self):
+        """Lazy initialization of the Gemini client"""
+        if self._client is None:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=self.api_key)
+                self._client = genai
+            except ImportError:
+                raise RuntimeError(
+                    "google-generativeai package not installed. "
+                    "Run: pip install google-generativeai"
+                )
+        return self._client
+
+    def query(self, system_prompt: str, user_message: str) -> str:
+        genai = self._get_client()
+
+        try:
+            # Create model with system instruction
+            model = genai.GenerativeModel(
+                model_name=self.model,
+                system_instruction=system_prompt
+            )
+
+            # Generate response
+            response = model.generate_content(
+                user_message,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=4096,
+                    temperature=0.7
+                )
+            )
+
+            # Handle response
+            if response.text:
+                return response.text
+            elif response.parts:
+                return "".join(part.text for part in response.parts if hasattr(part, 'text'))
+            else:
+                # Check if blocked by safety filters
+                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                    raise RuntimeError(f"Response blocked: {response.prompt_feedback.block_reason}")
+                raise RuntimeError("Empty response from Gemini")
+
+        except Exception as e:
+            error_msg = str(e)
+            if "API key" in error_msg or "authentication" in error_msg.lower():
+                raise RuntimeError(
+                    f"Gemini API authentication failed. Check your API key.\n"
+                    f"Get a key at: https://makersuite.google.com/app/apikey\n"
+                    f"Original error: {error_msg}"
+                )
+            elif "quota" in error_msg.lower() or "rate" in error_msg.lower():
+                raise RuntimeError(
+                    f"Gemini API rate limit or quota exceeded.\n"
+                    f"Original error: {error_msg}"
+                )
+            else:
+                raise RuntimeError(f"Gemini query failed: {error_msg}")
+
+    def list_models(self) -> list[str]:
+        """List available Gemini models"""
+        try:
+            genai = self._get_client()
+            models = []
+            for model in genai.list_models():
+                if 'generateContent' in model.supported_generation_methods:
+                    models.append(model.name.replace("models/", ""))
+            return models
+        except Exception:
+            return ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
 
 
 class OpenAICompatibleLLM(LLMInterface):
@@ -2420,6 +2504,10 @@ class AIInstallationAgent:
             llm = AnthropicLLM(config.api_key, config.model_name)
         elif config.llm_provider == LLMProvider.OPENAI:
             llm = OpenAILLM(config.api_key, config.model_name)
+        elif config.llm_provider == LLMProvider.GEMINI:
+            llm = GeminiLLM(config.api_key, config.model_name)
+            if config.verbose:
+                print(f"🔌 Using Google Gemini: {config.model_name}")
         elif config.llm_provider == LLMProvider.OPENAI_COMPATIBLE:
             if config.openai_compatible_config is None:
                 # Default to LM Studio config
