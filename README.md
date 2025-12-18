@@ -1,6 +1,9 @@
 # AI Installer CLI & GUI
 Install software with AI support!
 
+Notice: ai_installer_cli.py ai_installer_gui.py and ai_installer_config.py work 
+together and must be present in same directory.
+
 # Steps your AI Agent will make
 1. Analyze the target system state
 2. Plan the installation steps based on requirements and user support.
