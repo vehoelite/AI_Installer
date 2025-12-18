@@ -365,6 +365,25 @@ QFrame#output_panel {
 # Worker Thread for Background Operations
 # =============================================================================
 
+class GeminiWorkerThread(QThread):
+    """Background worker thread for Gemini API operations"""
+    finished_signal = Signal(dict)
+
+    def __init__(self, operation: str, api_key: str, model: str):
+        super().__init__()
+        self.operation = operation  # "test" or "fetch"
+        self.api_key = api_key
+        self.model = model
+
+    def run(self):
+        try:
+            llm = GeminiLLM(self.api_key, self.model)
+            models = llm.list_models()
+            self.finished_signal.emit({"success": True, "models": models})
+        except Exception as e:
+            self.finished_signal.emit({"success": False, "error": str(e)})
+
+
 class WorkerThread(QThread):
     """Background worker thread for LLM and system operations"""
     output = Signal(str)  # Emit output text
@@ -1812,7 +1831,14 @@ class SetupWizard(QDialog):
         gemini_layout.addRow("", gemini_key_link)
 
         self.gemini_model = QComboBox()
-        self.gemini_model.addItems(["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"])
+        self.gemini_model.addItems([
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        ])
         self.gemini_model.setEditable(True)
         gemini_layout.addRow("Model:", self.gemini_model)
 
@@ -1967,29 +1993,10 @@ class SetupWizard(QDialog):
         self.gemini_test_btn.setEnabled(False)
         self.gemini_fetch_btn.setEnabled(False)
 
-        # Run test in background thread
-        from PySide6.QtCore import QThread
-
-        def test_gemini():
-            try:
-                llm = GeminiLLM(api_key, self.gemini_model.currentText())
-                # Try a simple query to verify connection
-                models = llm.list_models()
-                return {"success": True, "models": models}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-
-        # Use QTimer to run async-like behavior
-        from PySide6.QtCore import QTimer
-        import threading
-
-        def run_test():
-            result = test_gemini()
-            # Update UI in main thread
-            QTimer.singleShot(0, lambda: self._on_gemini_test_complete(result))
-
-        thread = threading.Thread(target=run_test)
-        thread.start()
+        # Use QThread for proper Qt threading
+        self._gemini_worker = GeminiWorkerThread("test", api_key, self.gemini_model.currentText())
+        self._gemini_worker.finished_signal.connect(self._on_gemini_test_complete)
+        self._gemini_worker.start()
 
     def _on_gemini_test_complete(self, result):
         """Handle Gemini test result"""
@@ -2019,24 +2026,10 @@ class SetupWizard(QDialog):
         self.gemini_test_btn.setEnabled(False)
         self.gemini_fetch_btn.setEnabled(False)
 
-        # Run fetch in background thread
-        from PySide6.QtCore import QTimer
-        import threading
-
-        def fetch_models():
-            try:
-                llm = GeminiLLM(api_key, "gemini-2.0-flash")
-                models = llm.list_models()
-                return {"success": True, "models": models}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-
-        def run_fetch():
-            result = fetch_models()
-            QTimer.singleShot(0, lambda: self._on_gemini_fetch_complete(result))
-
-        thread = threading.Thread(target=run_fetch)
-        thread.start()
+        # Use QThread for proper Qt threading
+        self._gemini_worker = GeminiWorkerThread("fetch", api_key, "gemini-2.0-flash")
+        self._gemini_worker.finished_signal.connect(self._on_gemini_fetch_complete)
+        self._gemini_worker.start()
 
     def _on_gemini_fetch_complete(self, result):
         """Handle Gemini model fetch result"""
