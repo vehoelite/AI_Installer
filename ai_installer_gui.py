@@ -1110,10 +1110,12 @@ class WorkerThread(QThread):
 
         return False, f"Container status: {status}"
 
-    def _wait_for_containers_ready(self, executor, plan: dict, timeout: int = 60):
+    def _wait_for_containers_ready(self, executor, plan: dict, timeout: int = 120):
         """
         Wait for Docker containers to be fully ready before running tests.
         Extracts container names from the plan and polls their status.
+        For containers with health checks, waits for 'healthy' status.
+        Default timeout is 120 seconds (2 minutes) for complex apps like NextCloud AIO.
         """
         import time
 
@@ -1168,9 +1170,24 @@ class WorkerThread(QThread):
                     status = (result.stdout or '').strip()
 
                     if status and 'Up' in status:
-                        if last_status.get(name) != 'ready':
-                            self.output.emit(f"   [OK] {name}: Running ({status})")
-                            last_status[name] = 'ready'
+                        # Check if container has health check and if it's healthy
+                        if 'health' in status.lower():
+                            if 'healthy' in status.lower() and 'unhealthy' not in status.lower():
+                                # Container is healthy
+                                if last_status.get(name) != 'ready':
+                                    self.output.emit(f"   [OK] {name}: Healthy ({status})")
+                                    last_status[name] = 'ready'
+                            else:
+                                # Health check in progress (starting) or unhealthy
+                                all_ready = False
+                                if last_status.get(name) != status:
+                                    self.output.emit(f"   [..] {name}: {status} (waiting for health check)")
+                                    last_status[name] = status
+                        else:
+                            # No health check, just check if it's running
+                            if last_status.get(name) != 'ready':
+                                self.output.emit(f"   [OK] {name}: Running ({status})")
+                                last_status[name] = 'ready'
                     elif status:
                         all_ready = False
                         if last_status.get(name) != status:
