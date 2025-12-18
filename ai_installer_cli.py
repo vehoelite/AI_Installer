@@ -1030,7 +1030,14 @@ class OpenAILLM(LLMInterface):
 
 
 class GeminiLLM(LLMInterface):
-    """Google Gemini integration"""
+    """
+    Google Gemini integration using the new google-genai SDK.
+
+    Uses the unified Google GenAI SDK (google-genai package) which replaced
+    the deprecated google-generativeai package.
+
+    Install: pip install google-genai
+    """
 
     def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
         self.api_key = api_key
@@ -1041,30 +1048,27 @@ class GeminiLLM(LLMInterface):
         """Lazy initialization of the Gemini client"""
         if self._client is None:
             try:
-                import google.generativeai as genai
-                genai.configure(api_key=self.api_key)
-                self._client = genai
+                from google import genai
+                self._client = genai.Client(api_key=self.api_key)
             except ImportError:
                 raise RuntimeError(
-                    "google-generativeai package not installed. "
-                    "Run: pip install google-generativeai"
+                    "google-genai package not installed. "
+                    "Run: pip install google-genai"
                 )
         return self._client
 
     def query(self, system_prompt: str, user_message: str) -> str:
-        genai = self._get_client()
+        client = self._get_client()
 
         try:
-            # Create model with system instruction
-            model = genai.GenerativeModel(
-                model_name=self.model,
-                system_instruction=system_prompt
-            )
+            from google.genai import types
 
-            # Generate response
-            response = model.generate_content(
-                user_message,
-                generation_config=genai.types.GenerationConfig(
+            # Generate response with system instruction
+            response = client.models.generate_content(
+                model=self.model,
+                contents=user_message,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
                     max_output_tokens=4096,
                     temperature=0.7
                 )
@@ -1073,20 +1077,28 @@ class GeminiLLM(LLMInterface):
             # Handle response
             if response.text:
                 return response.text
-            elif response.parts:
-                return "".join(part.text for part in response.parts if hasattr(part, 'text'))
+            elif response.candidates and response.candidates[0].content:
+                parts = response.candidates[0].content.parts
+                return "".join(part.text for part in parts if hasattr(part, 'text'))
             else:
                 # Check if blocked by safety filters
-                if response.prompt_feedback and response.prompt_feedback.block_reason:
-                    raise RuntimeError(f"Response blocked: {response.prompt_feedback.block_reason}")
+                if response.candidates and response.candidates[0].finish_reason:
+                    finish_reason = response.candidates[0].finish_reason
+                    if finish_reason != "STOP":
+                        raise RuntimeError(f"Response blocked: {finish_reason}")
                 raise RuntimeError("Empty response from Gemini")
 
+        except ImportError:
+            raise RuntimeError(
+                "google-genai package not installed. "
+                "Run: pip install google-genai"
+            )
         except Exception as e:
             error_msg = str(e)
-            if "API key" in error_msg or "authentication" in error_msg.lower():
+            if "API key" in error_msg or "authentication" in error_msg.lower() or "API_KEY" in error_msg:
                 raise RuntimeError(
                     f"Gemini API authentication failed. Check your API key.\n"
-                    f"Get a key at: https://makersuite.google.com/app/apikey\n"
+                    f"Get a key at: https://aistudio.google.com/apikey\n"
                     f"Original error: {error_msg}"
                 )
             elif "quota" in error_msg.lower() or "rate" in error_msg.lower():
@@ -1100,12 +1112,17 @@ class GeminiLLM(LLMInterface):
     def list_models(self) -> list[str]:
         """List available Gemini models"""
         try:
-            genai = self._get_client()
+            client = self._get_client()
             models = []
-            for model in genai.list_models():
-                if 'generateContent' in model.supported_generation_methods:
-                    models.append(model.name.replace("models/", ""))
-            return models
+            for model in client.models.list():
+                # Filter for models that support content generation
+                model_name = model.name
+                if model_name.startswith("models/"):
+                    model_name = model_name[7:]  # Remove "models/" prefix
+                # Only include gemini models (not embedding models, etc.)
+                if "gemini" in model_name.lower():
+                    models.append(model_name)
+            return sorted(models) if models else ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
         except Exception:
             return ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
 
@@ -3348,7 +3365,7 @@ Examples:
 Supported cloud providers:
   anthropic - Anthropic Claude (default)
   openai    - OpenAI GPT
-  gemini    - Google Gemini (get API key: https://makersuite.google.com/app/apikey)
+  gemini    - Google Gemini (get API key: https://aistudio.google.com/apikey)
 
 Supported local providers (presets):
   lm-studio      - LM Studio (default: localhost:1234)
