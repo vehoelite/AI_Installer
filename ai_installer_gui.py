@@ -1266,6 +1266,13 @@ class WorkerThread(QThread):
             self.output.emit(f"   [FIX] Using venv python if available")
             return cmd
 
+        # Convert legacy docker-compose (v1) to docker compose (v2)
+        # docker-compose is deprecated and doesn't support newer compose file features
+        if original_cmd.startswith("docker-compose "):
+            cmd = "docker compose " + original_cmd[15:]  # Replace 'docker-compose ' with 'docker compose '
+            self.output.emit(f"   [FIX] Using modern 'docker compose' command (v2)")
+            return cmd
+
         return cmd
 
     def _attempt_immediate_repair(self, executor, failed_cmd: str, result, system_info, cwd: str, requires_sudo: bool) -> bool:
@@ -1336,6 +1343,16 @@ class WorkerThread(QThread):
 
             self.output.emit(f"   [*] Attempting {len(fix_steps)} repair action(s)...")
 
+            # Track if repair already ran an equivalent command
+            ran_equivalent_command = False
+            last_fix_succeeded = False
+
+            # Normalize failed command for comparison
+            failed_cmd_normalized = failed_cmd.strip().lower()
+            # Convert docker-compose to docker compose for comparison
+            if failed_cmd_normalized.startswith("docker-compose "):
+                failed_cmd_normalized = "docker compose " + failed_cmd_normalized[15:]
+
             for fix_step in fix_steps:
                 fix_commands = fix_step.get("commands", [])
                 for fix_cmd in fix_commands:
@@ -1345,6 +1362,11 @@ class WorkerThread(QThread):
                     # Skip if it's just a cd command
                     if fix_cmd.strip().startswith("cd "):
                         continue
+
+                    # Check if this fix command is equivalent to the original
+                    fix_cmd_normalized = fix_cmd.strip().lower()
+                    if fix_cmd_normalized == failed_cmd_normalized:
+                        ran_equivalent_command = True
 
                     display_cmd = fix_cmd if len(fix_cmd) < 60 else fix_cmd[:57] + "..."
                     self.output.emit(f"   $ {display_cmd}")
@@ -1366,11 +1388,18 @@ class WorkerThread(QThread):
 
                     if fix_result.success:
                         self.output.emit("   [OK] Repair step completed")
+                        last_fix_succeeded = True
                     else:
                         self.output.emit(f"   [FAIL] Repair step failed: {fix_result.stderr[:50] if fix_result.stderr else 'unknown'}")
+                        last_fix_succeeded = False
 
-            # Retry the original command if suggested
-            if fix_plan.get("should_retry_original", True):
+            # If we already ran an equivalent command and it succeeded, we're done
+            if ran_equivalent_command and last_fix_succeeded:
+                self.output.emit("   [OK] Repair completed (corrected command succeeded)")
+                return True
+
+            # Retry the original command if suggested and we haven't already run it
+            if fix_plan.get("should_retry_original", True) and not ran_equivalent_command:
                 self.output.emit(f"   [*] Retrying original command...")
                 try:
                     retry_result = executor.execute(failed_cmd, requires_sudo=requires_sudo, cwd=cwd)
@@ -1385,7 +1414,8 @@ class WorkerThread(QThread):
                     self.output.emit(f"   [FAIL] Original command still failing: {retry_result.stderr[:50] if retry_result.stderr else ''}")
                     return False
 
-            return False
+            # If last fix step succeeded, consider it a success
+            return last_fix_succeeded
 
         except Exception as e:
             self.output.emit(f"   [!] Repair error: {str(e)}")
