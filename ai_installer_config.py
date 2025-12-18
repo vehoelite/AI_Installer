@@ -16,7 +16,7 @@ from pathlib import Path
 @dataclass
 class LLMProviderSettings:
     """Settings for LLM provider configuration"""
-    provider: str = "local"  # "local", "openai", "anthropic"
+    provider: str = "local"  # "local", "openai", "anthropic", "gemini"
 
     # Local LLM settings
     local_preset: str = "lm-studio"  # "lm-studio", "ollama", "localai", "custom"
@@ -30,6 +30,8 @@ class LLMProviderSettings:
     openai_model: str = "gpt-4o"
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-20250514"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
 
     # Common settings
     temperature: float = 0.7
@@ -46,6 +48,11 @@ class AppSettings:
     confirm_before_execute: bool = True
     show_command_details: bool = True
     first_run_complete: bool = False
+
+    # Execution settings
+    confirm_each_step: bool = False  # Pause before each step for confirmation
+    auto_repair_enabled: bool = True  # Automatically attempt to fix failed steps
+    max_repair_attempts: int = 3  # Maximum number of auto-repair attempts
 
     # Window settings
     window_width: int = 1200
