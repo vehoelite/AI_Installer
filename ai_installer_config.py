@@ -56,7 +56,7 @@ class AppSettings:
 
     # Window settings
     window_width: int = 1200
-    window_height: int = 800
+    window_height: int = 1200
     window_x: int = -1  # -1 means center
     window_y: int = -1
 
@@ -66,7 +66,7 @@ class Config:
     """Main configuration container"""
     llm: LLMProviderSettings = field(default_factory=LLMProviderSettings)
     app: AppSettings = field(default_factory=AppSettings)
-    version: str = "1.0.0"
+    version: str = "1.2"
 
     def to_dict(self) -> dict:
         return {
