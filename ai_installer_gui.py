@@ -1807,7 +1807,7 @@ class SetupWizard(QDialog):
         self.gemini_key.setEchoMode(QLineEdit.Password)
         gemini_layout.addRow("API Key:", self.gemini_key)
 
-        gemini_key_link = QLabel('<a href="https://makersuite.google.com/app/apikey">Get API Key from Google AI Studio</a>')
+        gemini_key_link = QLabel('<a href="https://aistudio.google.com/apikey">Get API Key from Google AI Studio</a>')
         gemini_key_link.setOpenExternalLinks(True)
         gemini_layout.addRow("", gemini_key_link)
 
