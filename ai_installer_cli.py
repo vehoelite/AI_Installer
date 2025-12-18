@@ -877,6 +877,97 @@ class WebSearcher:
             "fetched_docs": fetched_content
         }
 
+    def search_error_solutions(self, search_query: str, error_message: str) -> dict:
+        """
+        Search for solutions to a specific error.
+        Focuses on Stack Overflow, GitHub issues, and troubleshooting guides.
+        """
+        self._log(f"Searching for error solutions: {search_query[:50]}...")
+
+        # Search DuckDuckGo with error-focused query
+        results = self.search_duckduckgo(search_query)
+
+        # Prioritize results from trusted troubleshooting sources
+        priority_sources = [
+            "stackoverflow.com",
+            "askubuntu.com",
+            "unix.stackexchange.com",
+            "superuser.com",
+            "github.com/issues",
+            "github.com/discussions",
+            "serverfault.com",
+            "linuxquestions.org",
+        ]
+
+        # Sort results to prioritize Stack Overflow and similar
+        def source_priority(result):
+            for i, source in enumerate(priority_sources):
+                if source in result.url:
+                    return i
+            return len(priority_sources)
+
+        results.sort(key=source_priority)
+
+        # Fetch content from top results
+        fetched_content = []
+        for result in results[:4]:  # Fetch top 4 results
+            self._log(f"Fetching solution: {result.title[:50]}...")
+
+            content = self.fetch_page_content(result.url)
+
+            if content:
+                # For Stack Overflow, try to extract just the accepted answer
+                if "stackoverflow.com" in result.url or "stackexchange.com" in result.url:
+                    content = self._extract_stackoverflow_answer(content)
+
+                result.content = content
+                fetched_content.append({
+                    "title": result.title,
+                    "url": result.url,
+                    "content": content[:4000],  # Limit per-source content
+                    "source_type": "stackoverflow" if "stackoverflow" in result.url else "other"
+                })
+
+        return {
+            "query": search_query,
+            "error_snippet": error_message[:200],
+            "results": [{"title": r.title, "url": r.url, "snippet": r.snippet} for r in results],
+            "fetched_docs": fetched_content
+        }
+
+    def _extract_stackoverflow_answer(self, html_content: str) -> str:
+        """Extract the accepted or top answer from Stack Overflow content"""
+        import re
+
+        # Try to find accepted answer first
+        accepted_match = re.search(
+            r'<div[^>]*class="[^"]*accepted-answer[^"]*"[^>]*>(.*?)</div>\s*<div[^>]*class="[^"]*post-layout',
+            html_content,
+            re.DOTALL | re.IGNORECASE
+        )
+
+        if accepted_match:
+            answer_html = accepted_match.group(1)
+        else:
+            # Try to find any answer
+            answer_match = re.search(
+                r'<div[^>]*class="[^"]*answer[^"]*"[^>]*>(.*?)</div>\s*<div[^>]*class="[^"]*post-layout',
+                html_content,
+                re.DOTALL | re.IGNORECASE
+            )
+            if answer_match:
+                answer_html = answer_match.group(1)
+            else:
+                return html_content  # Return original if no answer found
+
+        # Clean up HTML tags
+        text = re.sub(r'<script[^>]*>.*?</script>', '', answer_html, flags=re.DOTALL)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
 
 # ============================================================================
 # LLM Reasoner - The AI brain of the installer
@@ -2137,8 +2228,17 @@ class CommandExecutor:
             print(f"  {prefix.get(level, 'ℹ️')} {msg}")
 
     def execute(self, command: str, requires_sudo: bool = False,
-                timeout: int = 300, env: Optional[dict] = None) -> CommandResult:
-        """Execute a command and return the result"""
+                timeout: int = 300, env: Optional[dict] = None,
+                cwd: Optional[str] = None) -> CommandResult:
+        """Execute a command and return the result
+
+        Args:
+            command: The command to execute
+            requires_sudo: Whether to prepend sudo
+            timeout: Command timeout in seconds
+            env: Additional environment variables
+            cwd: Working directory for the command
+        """
         import time
 
         if requires_sudo and not command.startswith("sudo"):
@@ -2194,7 +2294,9 @@ class CommandExecutor:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env={**os.environ, **(env or {})}
+                env={**os.environ, **(env or {})},
+                cwd=cwd,
+                executable='/bin/bash'  # Use bash for better compatibility (source, etc.)
             )
             duration = time.time() - start_time
 
@@ -2345,6 +2447,133 @@ class AIInstallationAgent:
 
     def _print_section(self, msg: str):
         print(f"\n--- {msg} ---\n")
+
+    def _join_multiline_commands(self, commands: list) -> list:
+        """
+        Join commands that are split across multiple lines with backslash continuation.
+        This handles LLM output where docker commands are formatted like:
+        ['docker run -d \\', '  --name foo \\', '  image:tag']
+        And joins them into a single command.
+        """
+        if not commands:
+            return commands
+
+        joined = []
+        current_cmd = ""
+
+        for cmd in commands:
+            if isinstance(cmd, str):
+                cmd = cmd.strip()
+                if current_cmd:
+                    # Continue building multi-line command
+                    current_cmd += " " + cmd
+                else:
+                    current_cmd = cmd
+
+                # Check if this command continues on next line
+                if current_cmd.endswith("\\"):
+                    # Remove trailing backslash and continue
+                    current_cmd = current_cmd[:-1].strip()
+                else:
+                    # Command is complete
+                    if current_cmd:
+                        joined.append(current_cmd)
+                    current_cmd = ""
+
+        # Don't forget any remaining command
+        if current_cmd:
+            joined.append(current_cmd)
+
+        return joined
+
+    def _create_error_search_query(self, failed_cmd: str, error_msg: str) -> str:
+        """
+        Create a focused search query from a failed command and error message.
+        Optimized for finding solutions on Stack Overflow, GitHub, and forums.
+        """
+        # Extract the command name/tool (first word of command)
+        cmd_parts = failed_cmd.strip().split()
+        primary_tool = cmd_parts[0] if cmd_parts else "command"
+
+        # Handle sudo prefix
+        if primary_tool == "sudo" and len(cmd_parts) > 1:
+            primary_tool = cmd_parts[1]
+
+        # Clean up error message - extract the most relevant part
+        error_clean = error_msg.strip()
+
+        # Remove ANSI escape codes
+        error_clean = re.sub(r'\x1b\[[0-9;]*m', '', error_clean)
+
+        # Extract key error patterns
+        error_patterns = [
+            r'(?:error|Error|ERROR)[:\s]+(.+?)(?:\n|$)',
+            r'(?:failed|Failed|FAILED)[:\s]+(.+?)(?:\n|$)',
+            r'(?:cannot|Cannot|CANNOT)\s+(.+?)(?:\n|$)',
+            r'(?:No such file or directory)[:\s]*(.+?)(?:\n|$)',
+            r'(?:Permission denied)[:\s]*(.+?)(?:\n|$)',
+            r'(?:not found)[:\s]*(.+?)(?:\n|$)',
+            r'(?:command not found)[:\s]*(.+?)(?:\n|$)',
+            r'(?:ModuleNotFoundError|ImportError)[:\s]+(.+?)(?:\n|$)',
+            r'(?:E:|E\s+)[:\s]+(.+?)(?:\n|$)',  # apt/pip errors
+        ]
+
+        key_error = ""
+        for pattern in error_patterns:
+            match = re.search(pattern, error_clean, re.IGNORECASE)
+            if match:
+                key_error = match.group(0).strip()[:100]
+                break
+
+        # If no pattern matched, take first meaningful line
+        if not key_error:
+            lines = [l.strip() for l in error_clean.split('\n') if l.strip() and not l.strip().startswith('#')]
+            if lines:
+                # Skip lines that are just progress or status
+                for line in lines:
+                    if any(x in line.lower() for x in ['error', 'fail', 'cannot', 'denied', 'not found']):
+                        key_error = line[:100]
+                        break
+                if not key_error:
+                    key_error = lines[-1][:100]  # Often the last line has the error
+
+        # Get distro info for more relevant results
+        distro = ""
+        if self.system_info:
+            if hasattr(self.system_info, 'distro_name'):
+                distro = self.system_info.distro_name.lower()
+            elif hasattr(self.system_info, 'os_name'):
+                distro = self.system_info.os_name.lower()
+
+        # Build search query - prioritize Stack Overflow style
+        query_parts = []
+
+        # Add distro for context if it's Linux
+        if distro and 'ubuntu' in distro:
+            query_parts.append("ubuntu")
+        elif distro and 'debian' in distro:
+            query_parts.append("debian")
+        elif distro and any(x in distro for x in ['fedora', 'rhel', 'centos', 'rocky']):
+            query_parts.append("linux")
+
+        # Add the tool/command name
+        query_parts.append(primary_tool)
+
+        # Add cleaned error message
+        if key_error:
+            # Remove common noise from error
+            key_error = re.sub(r'^\d+[\.:]\s*', '', key_error)  # Remove line numbers
+            key_error = re.sub(r'^[\s\-\*]+', '', key_error)  # Remove leading dashes/bullets
+            query_parts.append(f'"{key_error}"')  # Quote for exact match
+
+        # Construct final query
+        search_query = ' '.join(query_parts)
+
+        # Ensure reasonable length
+        if len(search_query) > 150:
+            search_query = search_query[:150]
+
+        return search_query
 
     def _extract_ports_from_plan(self, plan: dict) -> list[int]:
         """Extract port numbers from installation commands"""
@@ -2706,8 +2935,11 @@ class AIInstallationAgent:
 
             print(f"\n📌 Step {step_num}: {description}")
 
+            # Join multi-line commands (handles LLM backslash continuations)
+            commands = self._join_multiline_commands(step.get("commands", []))
+
             if confirm_steps:
-                print(f"   Commands: {step['commands']}")
+                print(f"   Commands: {commands}")
                 response = input("   Execute this step? (yes/no/skip): ").lower().strip()
                 if response == "skip":
                     installation_results.append({"step": step_num, "skipped": True})
@@ -2717,7 +2949,7 @@ class AIInstallationAgent:
 
             # Execute commands in this step
             step_success = True
-            for cmd in step["commands"]:
+            for cmd in commands:
                 result = self.executor.execute(cmd, requires_sudo=step.get("requires_sudo", False))
 
                 if not result.success:
@@ -2727,11 +2959,50 @@ class AIInstallationAgent:
                     # Attempt troubleshooting
                     if self.config.max_retries > 0:
                         print("\n🔧 Attempting automated troubleshooting...")
+
+                        error_msg = result.stderr or result.stdout or "Unknown error"
+
+                        # Web search for solutions (Stack Overflow, GitHub issues, etc.)
+                        web_context = ""
+                        if self.web_searcher or self.config.web_search:
+                            try:
+                                print("🔍 Searching web for solutions...")
+                                searcher = self.web_searcher or WebSearcher(verbose=self.config.verbose)
+                                search_query = self._create_error_search_query(cmd, error_msg)
+
+                                if self.config.verbose:
+                                    print(f"   Search query: {search_query}")
+
+                                web_results = searcher.search_error_solutions(search_query, error_msg)
+
+                                if web_results and web_results.get("fetched_docs"):
+                                    num_results = len(web_results["fetched_docs"])
+                                    print(f"   ✅ Found {num_results} potential solution(s) online")
+
+                                    # Build context from web results
+                                    web_context = "\n\nWEB SEARCH RESULTS (Stack Overflow, GitHub, docs):\n"
+                                    for i, doc in enumerate(web_results["fetched_docs"][:3], 1):
+                                        title = doc.get("title", "Unknown")
+                                        content = doc.get("content", "")[:1500]
+                                        url = doc.get("url", "")
+                                        web_context += f"\n--- Solution {i}: {title} ---\n"
+                                        web_context += f"URL: {url}\n"
+                                        web_context += f"{content}\n"
+                                else:
+                                    print("   ℹ️  No web results found, using AI knowledge...")
+                            except Exception as e:
+                                if self.config.verbose:
+                                    print(f"   ⚠️  Web search error: {str(e)[:50]}")
+                                print("   ℹ️  Web search unavailable, using AI knowledge...")
+
+                        # Include web solutions in context
+                        enhanced_context = description + web_context
+
                         fix = self.reasoner.troubleshoot(
                             self.system_info,
-                            error_output=result.stderr,
+                            error_output=error_msg,
                             failed_command=cmd,
-                            context=description
+                            context=enhanced_context
                         )
 
                         print(f"\n📊 Analysis: {fix.get('error_analysis', 'Unknown error')}")
