@@ -2838,14 +2838,35 @@ class MainWindow(QMainWindow):
         """Detect if user input is a question vs modification request"""
         text_lower = text.lower().strip()
 
-        # Ends with question mark
+        # Action keywords that indicate a modification request (NOT a question)
+        # These take precedence even if the message starts with "can you" or ends with "?"
+        action_keywords = (
+            "kill", "stop", "terminate", "close", "free up",
+            "change port", "modify", "update the", "add step", "add a step",
+            "remove", "delete", "use port", "switch to", "replace",
+            "set ", "configure", "enable", "disable",
+            "yes", "go ahead", "proceed", "do it", "confirm",
+            "fix", "repair", "resolve", "free the port", "clear port"
+        )
+
+        # Check for action keywords first - these are modification requests
+        for action in action_keywords:
+            if action in text_lower:
+                return False  # This is a modification request
+
+        # "Can you", "Could you", "Would you", "Please" are often requests, not questions
+        request_starters = ("can you", "could you", "would you", "please")
+        if any(text_lower.startswith(s) for s in request_starters):
+            return False  # Treat as modification request
+
+        # Ends with question mark (and no action keywords found)
         if text.endswith("?"):
             return True
 
-        # Starts with question words
+        # Starts with pure question words
         question_starters = (
             "how ", "what ", "why ", "when ", "where ", "which ",
-            "who ", "can ", "could ", "would ", "is ", "are ", "do ", "does ",
+            "who ", "is ", "are ", "does ", "do ",
             "tell me", "explain", "describe"
         )
         if text_lower.startswith(question_starters):
