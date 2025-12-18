@@ -202,13 +202,25 @@ QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
 }
 
 QComboBox::drop-down {
-    border: none;
-    padding-right: 10px;
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    width: 30px;
+    border-left: 1px solid #45475a;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    background-color: #45475a;
 }
 
 QComboBox::down-arrow {
-    width: 12px;
-    height: 12px;
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #cdd6f4;
+}
+
+QComboBox:hover::drop-down {
+    background-color: #585b70;
 }
 
 QComboBox QAbstractItemView {
@@ -1795,8 +1807,8 @@ class SetupWizard(QDialog):
         openai_layout.addRow("API Key:", self.openai_key)
 
         self.openai_model = QComboBox()
-        self.openai_model.addItems(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"])
-        self.openai_model.setEditable(True)
+        self.openai_model.addItems(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"])
+        self.openai_model.setEditable(False)  # Dropdown only - prevents typos
         openai_layout.addRow("Model:", self.openai_model)
 
         self.settings_stack.addWidget(openai_widget)
@@ -1811,8 +1823,14 @@ class SetupWizard(QDialog):
         anthropic_layout.addRow("API Key:", self.anthropic_key)
 
         self.anthropic_model = QComboBox()
-        self.anthropic_model.addItems(["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"])
-        self.anthropic_model.setEditable(True)
+        self.anthropic_model.addItems([
+            "claude-sonnet-4-20250514",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku-20240307"
+        ])
+        self.anthropic_model.setEditable(False)  # Dropdown only - prevents typos
         anthropic_layout.addRow("Model:", self.anthropic_model)
 
         self.settings_stack.addWidget(anthropic_widget)
@@ -1830,7 +1848,9 @@ class SetupWizard(QDialog):
         gemini_key_link.setOpenExternalLinks(True)
         gemini_layout.addRow("", gemini_key_link)
 
+        # Model dropdown - proper dropdown, not editable text
         self.gemini_model = QComboBox()
+        self.gemini_model.setMinimumWidth(300)
         self.gemini_model.addItems([
             "gemini-2.5-flash",
             "gemini-2.5-pro",
@@ -1839,7 +1859,8 @@ class SetupWizard(QDialog):
             "gemini-1.5-flash",
             "gemini-1.5-pro",
         ])
-        self.gemini_model.setEditable(True)
+        # NOT editable - users must select from dropdown to avoid typos/errors
+        self.gemini_model.setEditable(False)
         gemini_layout.addRow("Model:", self.gemini_model)
 
         # Test connection and fetch models buttons
@@ -2053,7 +2074,7 @@ class SetupWizard(QDialog):
                 else:
                     self.gemini_model.setCurrentIndex(0)
 
-                self.gemini_status.setText(f"✓ Found {len(models)} models")
+                self.gemini_status.setText(f"✓ Loaded {len(models)} text generation models")
                 self.gemini_status.setStyleSheet("color: #a6e3a1;")
             else:
                 self.gemini_status.setText("✗ No models found")
