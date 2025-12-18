@@ -160,7 +160,7 @@ python ai_installer_cli.py --provider local --local-preset ollama --list-models
 python3 -m venv venv
 source venv/bin/activate
 pip install anthropic  # or openai
-export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY
+export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY or GEMINI_API_KEY
 ```
 
 # Prerequisites for GUI
