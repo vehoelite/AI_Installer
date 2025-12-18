@@ -169,7 +169,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install anthropic  # or openai
 # if using Google Gemini
-pip install google-generativeai
+pip install google-genai
 pip install PySide6
 python ai_installer_gui.py
 ```
