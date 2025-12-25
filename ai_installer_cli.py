@@ -28,6 +28,7 @@ class LLMProvider(Enum):
     ANTHROPIC = "anthropic"
     GEMINI = "gemini"  # Google Gemini
     OPENAI_COMPATIBLE = "openai_compatible"  # For LM Studio, Ollama, LocalAI, etc.
+    BUILTIN = "builtin"  # AI Installer's own trained model (offline!)
 
 
 @dataclass
@@ -206,6 +207,7 @@ class SystemInfo:
     disk_space: dict = field(default_factory=dict)
     memory_info: dict = field(default_factory=dict)
     ports_in_use: list = field(default_factory=list)  # List of ports currently in use
+    measured_internet_speed_mbps: Optional[float] = None  # Internet speed measured during installation planning
 
     def to_dict(self) -> dict:
         return {
@@ -232,6 +234,7 @@ class SystemInfo:
             "disk_space": self.disk_space,
             "memory_info": self.memory_info,
             "ports_in_use": self.ports_in_use[:100],  # Common ports in use
+            "measured_internet_speed_mbps": self.measured_internet_speed_mbps,
         }
 
 
@@ -284,6 +287,9 @@ class SystemAnalyzer:
 
         # Port Detection
         self._detect_ports(info)
+
+        # Internet Speed Test
+        self._test_internet_speed(info)
 
         return info
 
@@ -675,6 +681,440 @@ class SystemAnalyzer:
         if self.verbose and ports:
             self._log(f"Found {len(ports)} ports in use: {', '.join(map(str, sorted(ports)[:10]))}{'...' if len(ports) > 10 else ''}")
 
+    def _test_internet_speed(self, info: SystemInfo):
+        """Test internet speed by downloading from reliable sources using curl's speed measurement"""
+        self._log("Testing internet speed...")
+
+        speed_mbps = 10.0  # Default fallback
+        urls = [
+            ("https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png", "Google logo"),
+            ("https://raw.githubusercontent.com/torvalds/linux/master/README", "GitHub raw content"),
+            ("https://www.w3.org/WAI/WCAG21/Techniques/", "W3C content"),
+        ]
+
+        for url, source in urls:
+            try:
+                # Use curl's speed_download which measures bytes/sec
+                # Format: size_download bytes_sec time_total
+                code, out, _ = self._run_cmd(
+                    f"curl -s -L -w '%{{size_download}} %{{speed_download}} %{{time_total}}' '{url}' -o /dev/null",
+                    shell=True
+                )
+
+                if code == 0 and out.strip():
+                    parts = out.strip().split()
+                    if len(parts) >= 2:
+                        try:
+                            size_bytes = float(parts[0])
+                            speed_bytes_sec = float(parts[1])
+                            
+                            if size_bytes > 100 and speed_bytes_sec > 0:  # Only use if we got meaningful data
+                                # Convert bytes/sec to Mbps: (bytes/sec * 8 bits) / 1,000,000
+                                speed = (speed_bytes_sec * 8) / 1_000_000
+
+                                # Sanity check: speed should be between 0.1 and 10000 Mbps
+                                if 0.1 <= speed <= 10000:
+                                    speed_mbps = speed
+                                    self._log(f"Internet speed from {source}: {speed_mbps:.2f} Mbps (downloaded {size_bytes/1024:.1f}KB)")
+                                    break
+                        except (ValueError, IndexError):
+                            continue
+            except Exception as e:
+                self._log(f"Speed test failed for {source}: {str(e)}")
+                continue
+
+        info.measured_internet_speed_mbps = round(speed_mbps, 2)
+        self._log(f"Using internet speed: {info.measured_internet_speed_mbps:.2f} Mbps")
+
+
+
+@dataclass
+class ToolResult:
+    """Result from a tool call"""
+    success: bool
+    data: dict
+    error: str = ""
+
+
+class InstallerTools:
+    """
+    Native tools for AI Installer that work without external dependencies.
+
+    Priority order:
+    1. Native package manager commands (apt-cache, pacman, etc.)
+    2. HTTP APIs (Docker Hub, GitHub, PyPI)
+    3. Web scraping (fallback)
+
+    These tools help the model find correct package names, Docker images,
+    and versions even if they weren't in the training data.
+    """
+
+    DOCKER_HUB_API = "https://hub.docker.com/v2"
+    GITHUB_API = "https://api.github.com"
+    PYPI_API = "https://pypi.org/pypi"
+
+    def __init__(self, system_info: Optional['SystemInfo'] = None):
+        self.system_info = system_info
+        self._session = None
+
+    def _get_session(self):
+        """Get or create requests session"""
+        if self._session is None:
+            import requests
+            self._session = requests.Session()
+            self._session.headers.update({
+                'User-Agent': 'AI-Installer/1.0'
+            })
+        return self._session
+
+    def _run_cmd(self, cmd: str, timeout: int = 10) -> tuple[int, str, str]:
+        """Run a command and return (returncode, stdout, stderr)"""
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            )
+            return result.returncode, result.stdout.strip(), result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return -1, "", "Command timed out"
+        except Exception as e:
+            return -1, "", str(e)
+
+    # -------------------------------------------------------------------------
+    # Docker Hub Search
+    # -------------------------------------------------------------------------
+
+    def search_docker_hub(self, query: str, limit: int = 10) -> ToolResult:
+        """
+        Search Docker Hub for images.
+        Works without Docker installed - uses HTTP API directly.
+
+        Returns: List of images with name, description, stars, official status
+        """
+        try:
+            session = self._get_session()
+            url = f"{self.DOCKER_HUB_API}/search/repositories"
+            params = {"query": query, "page_size": limit}
+
+            response = session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            results = []
+            for item in data.get("results", []):
+                results.append({
+                    "name": item.get("repo_name", item.get("name", "")),
+                    "description": item.get("short_description", "")[:200],
+                    "stars": item.get("star_count", 0),
+                    "official": item.get("is_official", False),
+                    "automated": item.get("is_automated", False),
+                    "pull_count": item.get("pull_count", 0)
+                })
+
+            return ToolResult(
+                success=True,
+                data={"images": results, "query": query, "count": len(results)}
+            )
+        except Exception as e:
+            return ToolResult(success=False, data={}, error=str(e))
+
+    def get_docker_tags(self, image: str, limit: int = 10) -> ToolResult:
+        """
+        Get available tags for a Docker image.
+
+        Args:
+            image: Image name (e.g., "nginx", "portainer/portainer-ce")
+        """
+        try:
+            session = self._get_session()
+
+            # Handle official vs user images
+            if "/" not in image:
+                namespace = "library"
+                repo = image
+            else:
+                namespace, repo = image.split("/", 1)
+
+            url = f"{self.DOCKER_HUB_API}/repositories/{namespace}/{repo}/tags"
+            params = {"page_size": limit, "ordering": "-last_updated"}
+
+            response = session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            tags = []
+            for item in data.get("results", []):
+                tags.append({
+                    "name": item.get("name", ""),
+                    "size_mb": round(item.get("full_size", 0) / 1024 / 1024, 1),
+                    "last_updated": item.get("last_updated", "")[:10]
+                })
+
+            return ToolResult(
+                success=True,
+                data={"image": image, "tags": tags}
+            )
+        except Exception as e:
+            return ToolResult(success=False, data={}, error=str(e))
+
+    # -------------------------------------------------------------------------
+    # Package Manager Search (Native Commands)
+    # -------------------------------------------------------------------------
+
+    def search_packages(self, query: str, limit: int = 10) -> ToolResult:
+        """
+        Search system package manager for packages.
+        Auto-detects apt, pacman, dnf, apk, etc.
+        """
+        # Detect package manager
+        pkg_managers = [
+            ("apt-cache", "apt-cache search {query} | head -{limit}"),
+            ("pacman", "pacman -Ss {query} | head -{limit}"),
+            ("dnf", "dnf search {query} 2>/dev/null | head -{limit}"),
+            ("yum", "yum search {query} 2>/dev/null | head -{limit}"),
+            ("apk", "apk search {query} | head -{limit}"),
+            ("zypper", "zypper search {query} | head -{limit}"),
+        ]
+
+        for pkg_mgr, cmd_template in pkg_managers:
+            # Check if package manager exists
+            check_code, _, _ = self._run_cmd(f"which {pkg_mgr}")
+            if check_code == 0:
+                cmd = cmd_template.format(query=query, limit=limit * 2)
+                code, stdout, stderr = self._run_cmd(cmd, timeout=15)
+
+                if code == 0 and stdout:
+                    # Parse results
+                    packages = self._parse_package_results(pkg_mgr, stdout)
+                    return ToolResult(
+                        success=True,
+                        data={
+                            "packages": packages[:limit],
+                            "package_manager": pkg_mgr,
+                            "query": query
+                        }
+                    )
+
+        # Fallback: web search for package info
+        return self._search_packages_web(query, limit)
+
+    def _parse_package_results(self, pkg_mgr: str, output: str) -> list:
+        """Parse package search output based on package manager"""
+        packages = []
+
+        if pkg_mgr == "apt-cache":
+            # Format: "package-name - description"
+            for line in output.split("\n"):
+                if " - " in line:
+                    parts = line.split(" - ", 1)
+                    packages.append({
+                        "name": parts[0].strip(),
+                        "description": parts[1].strip() if len(parts) > 1 else ""
+                    })
+
+        elif pkg_mgr == "pacman":
+            # Format: "repo/package-name version\n    description"
+            lines = output.split("\n")
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if "/" in line and not line.startswith(" "):
+                    parts = line.split()
+                    if parts:
+                        name = parts[0].split("/")[-1]
+                        version = parts[1] if len(parts) > 1 else ""
+                        desc = lines[i+1].strip() if i+1 < len(lines) else ""
+                        packages.append({
+                            "name": name,
+                            "version": version,
+                            "description": desc
+                        })
+                i += 1
+
+        elif pkg_mgr in ("dnf", "yum"):
+            # Format varies, try common pattern
+            for line in output.split("\n"):
+                if ".x86_64" in line or ".noarch" in line or ".i686" in line:
+                    parts = line.split()
+                    if parts:
+                        packages.append({
+                            "name": parts[0].rsplit(".", 1)[0],
+                            "description": " ".join(parts[2:]) if len(parts) > 2 else ""
+                        })
+
+        elif pkg_mgr == "apk":
+            # Format: "package-name-version"
+            for line in output.split("\n"):
+                if line.strip():
+                    packages.append({"name": line.strip(), "description": ""})
+
+        return packages
+
+    def _search_packages_web(self, query: str, limit: int) -> ToolResult:
+        """Fallback: search packages via web"""
+        try:
+            session = self._get_session()
+            # Try packages.ubuntu.com
+            url = f"https://packages.ubuntu.com/search"
+            params = {"keywords": query, "searchon": "names", "suite": "noble"}
+
+            response = session.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                # Basic parsing
+                packages = []
+                import re
+                matches = re.findall(r'<a href="/noble/([^"]+)">\1</a>', response.text)
+                for match in matches[:limit]:
+                    packages.append({"name": match, "description": ""})
+
+                if packages:
+                    return ToolResult(
+                        success=True,
+                        data={"packages": packages, "source": "packages.ubuntu.com", "query": query}
+                    )
+        except:
+            pass
+
+        return ToolResult(success=False, data={}, error="No package manager found and web fallback failed")
+
+    def get_package_info(self, package: str) -> ToolResult:
+        """Get detailed info about a specific package"""
+        # Try apt-cache show first
+        code, stdout, _ = self._run_cmd(f"apt-cache show {package} 2>/dev/null | head -30")
+        if code == 0 and stdout:
+            info = {"name": package, "raw": stdout}
+            # Parse key fields
+            for line in stdout.split("\n"):
+                if line.startswith("Version:"):
+                    info["version"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Description"):
+                    info["description"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Depends:"):
+                    info["depends"] = line.split(":", 1)[1].strip()
+            return ToolResult(success=True, data=info)
+
+        # Try pacman
+        code, stdout, _ = self._run_cmd(f"pacman -Si {package} 2>/dev/null | head -20")
+        if code == 0 and stdout:
+            return ToolResult(success=True, data={"name": package, "raw": stdout})
+
+        return ToolResult(success=False, data={}, error=f"Package '{package}' not found")
+
+    # -------------------------------------------------------------------------
+    # GitHub Releases
+    # -------------------------------------------------------------------------
+
+    def get_github_releases(self, repo: str, limit: int = 5) -> ToolResult:
+        """
+        Get latest releases from a GitHub repo.
+
+        Args:
+            repo: Repository in format "owner/repo" (e.g., "docker/compose")
+        """
+        try:
+            session = self._get_session()
+            url = f"{self.GITHUB_API}/repos/{repo}/releases"
+            params = {"per_page": limit}
+
+            response = session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            releases = []
+            for item in data:
+                releases.append({
+                    "tag": item.get("tag_name", ""),
+                    "name": item.get("name", ""),
+                    "published": item.get("published_at", "")[:10],
+                    "prerelease": item.get("prerelease", False),
+                    "assets": len(item.get("assets", []))
+                })
+
+            return ToolResult(
+                success=True,
+                data={"repo": repo, "releases": releases}
+            )
+        except Exception as e:
+            return ToolResult(success=False, data={}, error=str(e))
+
+    # -------------------------------------------------------------------------
+    # Snap Store Search
+    # -------------------------------------------------------------------------
+
+    def search_snaps(self, query: str, limit: int = 10) -> ToolResult:
+        """Search Snap Store for packages"""
+        code, stdout, _ = self._run_cmd(f"snap find {query} 2>/dev/null | head -{limit + 1}")
+        if code == 0 and stdout:
+            snaps = []
+            lines = stdout.split("\n")[1:]  # Skip header
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 4:
+                    snaps.append({
+                        "name": parts[0],
+                        "version": parts[1],
+                        "publisher": parts[2],
+                        "summary": " ".join(parts[4:]) if len(parts) > 4 else ""
+                    })
+            return ToolResult(success=True, data={"snaps": snaps, "query": query})
+
+        return ToolResult(success=False, data={}, error="snap command not available")
+
+    # -------------------------------------------------------------------------
+    # PyPI Search
+    # -------------------------------------------------------------------------
+
+    def get_pypi_info(self, package: str) -> ToolResult:
+        """Get package info from PyPI"""
+        try:
+            session = self._get_session()
+            url = f"{self.PYPI_API}/{package}/json"
+
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            info = data.get("info", {})
+            return ToolResult(
+                success=True,
+                data={
+                    "name": info.get("name", package),
+                    "version": info.get("version", ""),
+                    "summary": info.get("summary", ""),
+                    "author": info.get("author", ""),
+                    "requires_python": info.get("requires_python", ""),
+                    "home_page": info.get("home_page", "")
+                }
+            )
+        except Exception as e:
+            return ToolResult(success=False, data={}, error=str(e))
+
+    # -------------------------------------------------------------------------
+    # Unified Search Interface
+    # -------------------------------------------------------------------------
+
+    def search(self, query: str, source: str = "auto") -> ToolResult:
+        """
+        Unified search across all sources.
+
+        Args:
+            query: What to search for
+            source: "docker", "packages", "snaps", "github", "pypi", or "auto"
+        """
+        if source == "docker" or (source == "auto" and any(kw in query.lower() for kw in ["container", "image", "docker"])):
+            return self.search_docker_hub(query.replace("docker", "").strip())
+
+        elif source == "snaps":
+            return self.search_snaps(query)
+
+        elif source == "pypi" or (source == "auto" and any(kw in query.lower() for kw in ["pip", "python", "pypi"])):
+            return self.get_pypi_info(query.replace("pip", "").replace("python", "").strip())
+
+        elif source == "github":
+            return self.get_github_releases(query)
+
+        else:  # packages or auto
+            return self.search_packages(query)
+
 
 # ============================================================================
 # Web Search - Fetch up-to-date installation instructions
@@ -710,10 +1150,33 @@ class WebSearcher:
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
+        self._is_online: Optional[bool] = None  # Cached connectivity status
 
     def _log(self, msg: str):
         if self.verbose:
             print(f"  [WebSearch] {msg}")
+
+    def is_online(self) -> bool:
+        """Check if we have internet connectivity (cached)"""
+        if self._is_online is not None:
+            return self._is_online
+
+        import urllib.request
+        import urllib.error
+
+        # Try a quick connectivity check
+        try:
+            req = urllib.request.Request(
+                "https://duckduckgo.com/",
+                headers={'User-Agent': 'AI-Installer/1.0'}
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                self._is_online = True
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+            self._is_online = False
+            self._log("Offline mode: web search disabled")
+
+        return self._is_online
 
     def search_duckduckgo(self, query: str, max_results: int = 5) -> list[WebSearchResult]:
         """Search DuckDuckGo for installation instructions"""
@@ -847,7 +1310,12 @@ class WebSearcher:
         """
         Search for installation documentation for a specific software.
         Returns a dict with search results and fetched content.
+        Gracefully returns empty dict if offline.
         """
+        # Check connectivity first
+        if not self.is_online():
+            return {"search_results": [], "fetched_content": [], "offline": True}
+
         self._log(f"Searching for installation docs: {software}")
 
         # Build search query
@@ -1288,6 +1756,621 @@ class OpenAICompatibleLLM(LLMInterface):
                 raise RuntimeError(f"LLM query failed: {error_msg}")
 
 
+class BuiltinLLM(LLMInterface):
+    """
+    Built-in LLM using AI Installer's locally-trained model.
+
+    Supports two model formats:
+    1. GGUF (preferred) - Compact (~1GB), fast, works on CPU. Uses llama-cpp-python.
+    2. HuggingFace (fallback) - Full model (~3GB), requires more VRAM. Uses transformers.
+
+    The model was trained on installation scenarios and understands
+    system analysis, installation planning, and troubleshooting.
+
+    JSON Response Handling:
+    -----------------------
+    The InstallationReasoner expects JSON responses. This class automatically:
+    1. Detects when JSON output is expected from the system prompt
+    2. Adds explicit JSON formatting instructions to the prompt
+    3. Extracts JSON from the model's response (handles markdown code blocks)
+    4. Falls back to a structured default if JSON parsing fails
+    """
+
+    # Model paths - relative to script directory (./models/)
+    # GGUF format (preferred - smaller, faster)
+    DEFAULT_GGUF_PATHS = [
+        "./models/ai_installer.gguf",
+        "./models/ai_installer-q4_k_m.gguf",
+        "./models/ai_installer-q4_0.gguf",
+        "./models/ai_installer-q5_k_m.gguf",
+        "./models/ai_installer-q8_0.gguf",
+        "./models/ai_installer-f16.gguf",
+    ]
+
+    # HuggingFace format (fallback)
+    DEFAULT_HF_PATHS = [
+        "./models/ai_installer_agent/merged",
+        "./models/ai_installer_agent",
+    ]
+
+    # JSON format enhancement - added to prompts when JSON is expected
+    JSON_FORMAT_INSTRUCTION = """
+
+CRITICAL OUTPUT FORMAT:
+You MUST respond with ONLY a valid JSON object. No explanations, no markdown, no code blocks.
+Just the raw JSON starting with { and ending with }
+"""
+
+    def __init__(self):
+        """
+        Initialize the built-in LLM.
+
+        Model is auto-detected from ./models/ directory.
+        """
+        self._model = None
+        self._tokenizer = None
+        self._device = None
+        self._loaded = False
+        self._is_gguf = False  # Track which backend we're using
+
+    def _find_model(self) -> tuple:
+        """
+        Find the model from ./models/ directory.
+
+        Returns:
+            tuple: (model_path, is_gguf)
+        """
+        from pathlib import Path
+
+        # Search for GGUF models first (preferred - smaller, faster)
+        for default_path in self.DEFAULT_GGUF_PATHS:
+            path = Path(default_path).expanduser()
+            if path.exists() and path.is_file():
+                return str(path), True
+
+        # Also check for any .gguf file in model directories
+        for default_path in self.DEFAULT_HF_PATHS:
+            path = Path(default_path).expanduser()
+            if path.exists() and path.is_dir():
+                gguf_files = list(path.glob("*.gguf"))
+                if gguf_files:
+                    # Prefer q4_k_m quantization
+                    for gf in gguf_files:
+                        if "q4_k_m" in gf.name.lower():
+                            return str(gf), True
+                    return str(gguf_files[0]), True
+
+        # Fall back to HuggingFace format
+        for default_path in self.DEFAULT_HF_PATHS:
+            path = Path(default_path).expanduser()
+            if path.exists() and path.is_dir():
+                # Check if it's a valid HF model directory
+                if (path / "config.json").exists() or list(path.glob("*.safetensors")) or list(path.glob("*.bin")):
+                    return str(path), False
+
+        raise FileNotFoundError(
+            "AI Installer model not found!\n\n"
+            "The model should be placed in the ./models/ directory.\n\n"
+            "Expected GGUF paths (recommended, ~1GB" +
+            "\n".join(f"  - {p}" for p in self.DEFAULT_GGUF_PATHS) + "\n\n"
+            "Expected HuggingFace paths (fallback, ~3GB):\n" +
+            "\n".join(f"  - {p}" for p in self.DEFAULT_HF_PATHS) + "\n\n"
+            "Copy the trained model from ~/training/models/ai_installer_agent/\n"
+            "to ./models/ai_installer_agent/"
+        )
+
+    def _load_model(self):
+        """Load the model (lazy loading). Prefers GGUF format for efficiency."""
+        if self._loaded:
+            return
+
+        model_path, self._is_gguf = self._find_model()
+
+        if self._is_gguf:
+            self._load_gguf_model(model_path)
+        else:
+            self._load_hf_model(model_path)
+
+        self._loaded = True
+
+    def _load_gguf_model(self, model_path: str):
+        """Load a GGUF model using llama-cpp-python (efficient, CPU-friendly)"""
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            raise RuntimeError(
+                "llama-cpp-python is required for GGUF models.\n"
+                "Install with: pip install llama-cpp-python\n\n"
+                "For GPU acceleration, install with CUDA support:\n"
+                "  CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install llama-cpp-python --force-reinstall --no-cache-dir"
+            )
+
+        from pathlib import Path
+        import os
+
+        print(f"\n[Model] Loading AI Installer Agent (GGUF format)...")
+        print(f"   Path: {model_path}")
+
+        # Get file size
+        size_mb = Path(model_path).stat().st_size / (1024 * 1024)
+        print(f"   Size: {size_mb:.1f} MB")
+
+        # Determine GPU layers
+        n_gpu_layers = 0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Use GPU for acceleration
+                n_gpu_layers = -1  # -1 means all layers on GPU
+                gpu_name = torch.cuda.get_device_name(0)
+                print(f"   GPU: {gpu_name} (offloading all layers)")
+            else:
+                print("   Device: CPU")
+        except ImportError:
+            print("   Device: CPU (torch not available)")
+
+        # Load the model
+        print("   Loading model...")
+        self._model = Llama(
+            model_path=model_path,
+            n_ctx=4096,  # Context window
+            n_threads=min(os.cpu_count() or 4, 8),  # CPU threads (max 8)
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,  # Suppress llama.cpp output
+        )
+
+        print("[OK] AI Installer Agent ready! (GGUF)\n")
+
+    def _load_hf_model(self, model_path: str):
+        """Load a HuggingFace model using transformers (larger, requires GPU)"""
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError:
+            raise RuntimeError(
+                "transformers and torch are required for HuggingFace models.\n"
+                "Install with: pip install transformers torch accelerate\n\n"
+                "For a smaller model, use GGUF format instead:\n"
+                "  pip install llama-cpp-python"
+            )
+
+        print(f"\n[Model] Loading AI Installer Agent (HuggingFace format)...")
+        print(f"   Path: {model_path}")
+        print("   Note: Consider using GGUF format for faster loading (~1GBs ~3GB)")
+
+        # Determine device and precision
+        if torch.cuda.is_available():
+            self._device = "cuda"
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            compute_cap = torch.cuda.get_device_capability(0)
+
+            # Use bf16 for Ampere+ (RTX 30xx, 40xx, 50xx), fp16 for older
+            if compute_cap[0] >= 8:
+                dtype = torch.bfloat16
+                print(f"   GPU: {gpu_name} ({gpu_mem:.1f}GB) - Using BFloat16")
+            else:
+                dtype = torch.float16
+                print(f"   GPU: {gpu_name} ({gpu_mem:.1f}GB) - Using Float16")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self._device = "mps"
+            dtype = torch.float16
+            print("   Device: Apple Silicon GPU")
+        else:
+            self._device = "cpu"
+            dtype = torch.float32
+            print("   Device: CPU (this may be slow)")
+
+        # Load tokenizer
+        print("   Loading tokenizer...")
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+
+        # Load model
+        print("   Loading model weights...")
+        self._model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+
+        print("[OK] AI Installer Agent ready! (HuggingFace)\n")
+
+    def _expects_json(self, system_prompt: str, user_message: str) -> bool:
+        """
+        Detect if the prompt expects a JSON response.
+
+        Key insight: We need to check the USER MESSAGE for conversational patterns.
+        If the user is asking a question or chatting, they want a conversational response,
+        NOT JSON - even if the system prompt mentions JSON.
+        """
+        user_lower = user_message.lower().strip()
+
+        # Conversational patterns - these should NOT trigger JSON mode
+        conversational_patterns = [
+            # Questions about the plan
+            "where", "what", "why", "how", "when", "which", "who",
+            "is this", "are these", "will this", "can you", "could you",
+            "tell me", "explain", "describe", "show me",
+            # Confirmations and clarifications
+            "yes", "no", "okay", "ok", "sure", "please",
+            "more info", "more details", "elaborate",
+            # Concerns and safety
+            "safe", "dangerous", "risk", "careful", "worried",
+            # Modifications
+            "change", "modify", "update", "instead", "rather",
+            "don't", "skip", "remove", "add",
+            # General chat
+            "thanks", "thank you", "hello", "hi", "hey",
+            "?",  # Any question mark
+        ]
+
+        # If user message looks conversational, return False (no JSON)
+        for pattern in conversational_patterns:
+            if pattern in user_lower:
+                return False
+
+        # Check if this is an installation request that needs JSON
+        # Only the USER message matters here, not system prompt
+        json_indicators_in_user = [
+            "analyze", "install", "setup", "deploy", "configure",
+            "respond with a json", "json object", "json response",
+        ]
+
+        # Check if system prompt explicitly requests JSON structure
+        system_lower = system_prompt.lower()
+        system_wants_json = any(ind in system_lower for ind in [
+            "respond with a json",
+            "json object containing",
+            '"installation_steps"',
+        ])
+
+        # Check if user message is an installation-type request
+        user_is_install_request = any(ind in user_lower for ind in json_indicators_in_user)
+
+        # Also check for software request pattern in system prompt
+        # (this is how InstallationReasoner.analyze_requirements formats it)
+        is_analyze_request = "software request:" in system_lower and "system information:" in system_lower
+
+        return system_wants_json and (user_is_install_request or is_analyze_request)
+
+    def _extract_json(self, response: str) -> str:
+        """
+        Extract JSON from the response, handling various formats.
+
+        The model might output:
+        1. Pure JSON: {"key": "value"}
+        2. Markdown code blocks: ```json\n{...}\n```
+        3. Mixed text with JSON embedded
+        4. Pure prose (fallback to prose_to_json conversion)
+        """
+        import re
+
+        # Try to find JSON in markdown code blocks first
+        json_block_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
+        matches = re.findall(json_block_pattern, response)
+        for match in matches:
+            try:
+                json.loads(match.strip())
+                return match.strip()
+            except json.JSONDecodeError:
+                continue
+
+        # Try to find raw JSON object
+        # Look for the outermost { ... } pair
+        brace_count = 0
+        start_idx = -1
+        for i, char in enumerate(response):
+            if char == '{':
+                if brace_count == 0:
+                    start_idx = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and start_idx != -1:
+                    potential_json = response[start_idx:i+1]
+                    try:
+                        json.loads(potential_json)
+                        return potential_json
+                    except json.JSONDecodeError:
+                        # Continue looking for valid JSON
+                        start_idx = -1
+
+        # No valid JSON found - try to convert prose to JSON
+        print("  ⚠️  DEBUG: Model output prose instead of JSON, using fallback converter")
+        print(f"      First 100 chars: {response[:100]}...")
+        return self._prose_to_json(response)
+
+    def _prose_to_json(self, prose: str) -> str:
+        """
+        FALLBACK: Convert prose installation instructions to JSON format.
+
+        It exists as a safety net for edge cases or model issues.
+        """
+        import re
+
+        # Extract commands from the prose
+        commands = []
+
+        # Pattern for common command prefixes
+        command_patterns = [
+            # sudo commands
+            r'(sudo\s+[^\n\.\!\?]+)',
+            # apt/apt-get commands
+            r'(apt(?:-get)?\s+[^\n\.\!\?]+)',
+            # docker commands
+            r'(docker\s+[^\n\.\!\?]+)',
+            # systemctl commands
+            r'(systemctl\s+[^\n\.\!\?]+)',
+            # wget/curl commands
+            r'((?:wget|curl)\s+[^\n\.\!\?]+)',
+            # pip commands
+            r'(pip3?\s+install\s+[^\n\.\!\?]+)',
+            # Commands in backticks or code blocks
+            r'`([^`]+)`',
+            # Commands after "run:" or "command:"
+            r'(?:run|command|execute)[:\s]+([^\n]+)',
+        ]
+
+        for pattern in command_patterns:
+            matches = re.findall(pattern, prose, re.IGNORECASE)
+            for match in matches:
+                cmd = match.strip()
+                # Clean up the command
+                cmd = re.sub(r'\s+', ' ', cmd)  # Normalize whitespace
+                cmd = cmd.rstrip('.,;:')  # Remove trailing punctuation
+                if cmd and len(cmd) > 3 and cmd not in commands:
+                    commands.append(cmd)
+
+        # Extract software name from the prose
+        software_name = "Software"
+        name_patterns = [
+            r'install\s+(\w+(?:[-_]\w+)*)',
+            r'(\w+(?:[-_]\w+)*)\s+(?:installation|browser|server|application)',
+        ]
+        for pattern in name_patterns:
+            match = re.search(pattern, prose, re.IGNORECASE)
+            if match:
+                software_name = match.group(1).title()
+                break
+
+        # Build installation steps
+        installation_steps = []
+        step_num = 1
+
+        # Group related commands or create individual steps
+        if commands:
+            # Check if there's a combined apt update && apt install command
+            combined_apt = None
+            for cmd in commands:
+                if 'apt update' in cmd.lower() and 'apt install' in cmd.lower():
+                    combined_apt = cmd
+                    break
+
+            if combined_apt:
+                installation_steps.append({
+                    "step": step_num,
+                    "description": f"Update package lists and install {software_name}",
+                    "commands": [combined_apt],
+                    "requires_sudo": "sudo" in combined_apt.lower(),
+                    "risk_level": "low"
+                })
+                step_num += 1
+            else:
+                # Add apt update if we have apt install
+                has_apt_install = any('apt install' in cmd.lower() or 'apt-get install' in cmd.lower() for cmd in commands)
+                has_apt_update = any('apt update' in cmd.lower() or 'apt-get update' in cmd.lower() for cmd in commands)
+
+                if has_apt_install and not has_apt_update:
+                    installation_steps.append({
+                        "step": step_num,
+                        "description": "Update package lists",
+                        "commands": ["sudo apt update"],
+                        "requires_sudo": True,
+                        "risk_level": "low"
+                    })
+                    step_num += 1
+
+                # Add each command as a step
+                for cmd in commands:
+                    if 'apt update' in cmd.lower() and has_apt_install:
+                        continue  # Skip standalone update if we have install
+                    installation_steps.append({
+                        "step": step_num,
+                        "description": f"Execute: {cmd[:50]}..." if len(cmd) > 50 else f"Execute: {cmd}",
+                        "commands": [cmd],
+                        "requires_sudo": "sudo" in cmd.lower(),
+                        "risk_level": "low"
+                    })
+                    step_num += 1
+        else:
+            # No commands found - create a generic apt install step
+            pkg_name = software_name.lower().replace(' ', '-')
+            installation_steps = [
+                {
+                    "step": 1,
+                    "description": "Update package lists",
+                    "commands": ["sudo apt update"],
+                    "requires_sudo": True,
+                    "risk_level": "low"
+                },
+                {
+                    "step": 2,
+                    "description": f"Install {software_name}",
+                    "commands": [f"sudo apt install -y {pkg_name}"],
+                    "requires_sudo": True,
+                    "risk_level": "low"
+                }
+            ]
+
+        # Build the full JSON response
+        result = {
+            "compatible": True,
+            "compatibility_issues": [],
+            "software_name": software_name,
+            "prerequisites": [],
+            "installation_steps": installation_steps,
+            "configuration": {
+                "ports": [],
+                "data_directory": "",
+                "config_files": []
+            },
+            "estimated_time_minutes": len(installation_steps) * 2,
+            "disk_space_required_gb": 1,
+            "warnings": [],
+            "post_install_tests": [
+                {
+                    "name": f"Check {software_name} installation",
+                    "command": f"which {software_name.lower()} || dpkg -l | grep -i {software_name.lower()}",
+                    "expected_output_contains": software_name.lower()
+                }
+            ]
+        }
+
+        return json.dumps(result, indent=2)
+
+    def query(self, system_prompt: str, user_message: str) -> str:
+        """
+        Generate a response using the built-in model.
+
+        Matches the LLMInterface expected by AIInstallationAgent.
+        Supports both GGUF (llama-cpp-python) and HuggingFace backends.
+
+        Automatically detects JSON requirements and:
+        1. Adds explicit JSON formatting instructions
+        2. Forces JSON output by starting with '{'
+        3. Uses lower temperature for deterministic JSON
+        4. Extracts and validates JSON from response
+        """
+        self._load_model()
+
+        # Detect if JSON output is expected
+        expects_json = self._expects_json(system_prompt, user_message)
+
+        # Enhance prompt with JSON instructions if needed
+        enhanced_user_message = user_message
+        if expects_json:
+            enhanced_user_message = user_message + self.JSON_FORMAT_INSTRUCTION
+
+        # Build prompt in Alpaca format (matches training format)
+        # NOTE: Training data does NOT use ### System: - it puts everything in Instruction
+        # For JSON, we start the response with '{' to force JSON output
+        if expects_json:
+            full_prompt = f"""### Instruction:
+{system_prompt}
+
+{enhanced_user_message}
+
+### Response:
+{{"""
+        else:
+            full_prompt = f"""### Instruction:
+{system_prompt}
+
+{enhanced_user_message}
+
+### Response:
+"""
+
+        # Route to appropriate backend
+        if self._is_gguf:
+            response = self._generate_gguf(full_prompt, expects_json)
+        else:
+            response = self._generate_hf(full_prompt, expects_json)
+
+        # For JSON, we need to prepend the '{' we started with
+        if expects_json:
+            response = "{" + response
+            response = self._extract_json(response)
+
+        return response
+
+    def _generate_gguf(self, prompt: str, expects_json: bool) -> str:
+        """Generate response using GGUF/llama-cpp-python backend"""
+        # Use lower temperature for JSON to get more deterministic output
+        temperature = 0.3 if expects_json else 0.7
+        top_p = 0.85 if expects_json else 0.9
+
+        # llama-cpp-python uses a simple API
+        output = self._model(
+            prompt,
+            max_tokens=2048,
+            temperature=temperature,
+            top_p=top_p,
+            repeat_penalty=1.1,
+            stop=["### Instruction:", "### System:", "\n\n\n"],  # Stop tokens
+        )
+
+        response = output["choices"][0]["text"].strip()
+        return response
+
+    def _generate_hf(self, prompt: str, expects_json: bool) -> str:
+        """Generate response using HuggingFace/transformers backend"""
+        import torch
+
+        # Tokenize
+        inputs = self._tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=3072  # Leave room for generation
+        )
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+
+        # Use lower temperature for JSON to get more deterministic output
+        temperature = 0.3 if expects_json else 0.7
+        top_p = 0.85 if expects_json else 0.9
+
+        # Generate
+        with torch.no_grad():
+            outputs = self._model.generate(
+                **inputs,
+                max_new_tokens=4096,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=1.1,
+                do_sample=True,
+                pad_token_id=self._tokenizer.eos_token_id,
+                eos_token_id=self._tokenizer.eos_token_id,
+            )
+
+        # Decode response (only the new tokens)
+        response = self._tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        ).strip()
+
+        return response
+
+    def unload(self):
+        """Unload model from memory to free GPU/RAM"""
+        if self._model:
+            del self._model
+            self._model = None
+        if self._tokenizer:
+            del self._tokenizer
+            self._tokenizer = None
+        self._loaded = False
+
+        import gc
+        gc.collect()
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
+
+        print("🧠 Model unloaded from memory")
+
+
 class RawHTTPLLM(LLMInterface):
     """
     Raw HTTP implementation for OpenAI-compatible APIs.
@@ -1335,7 +2418,20 @@ class RawHTTPLLM(LLMInterface):
 
 
 class InstallationReasoner:
-    """The AI brain that plans and reasons about installations"""
+    """The AI brain that plans and reasons about installations.
+
+    Dual-Mode Reasoning (Qwen3 Feature):
+    - Thinking mode (default): Used for installation planning, troubleshooting, and
+      complex analysis where deep reasoning improves quality.
+    - Non-thinking mode (/no_think): Used for Q&A responses where faster responses
+      are preferred and deep reasoning adds latency without benefit.
+
+    Native Tool Support:
+    - When InstallerTools is provided, the model can request tool calls during planning
+    - Tools help find correct package names, Docker images, and versions even if
+      not in training data
+    - Agent loop executes tools and feeds results back to the model
+    """
 
     SYSTEM_PROMPT = """You are an expert system administrator and software installation specialist.
 Your role is to analyze system information, plan software installations, execute commands,
@@ -1365,14 +2461,632 @@ You have deep knowledge of:
 - System configuration and environment variables
 """
 
-    def __init__(self, llm: LLMInterface):
+    # Tool descriptions for the model when tools are available
+    TOOL_DESCRIPTIONS = """
+AVAILABLE TOOLS:
+You can request tool calls to find exact package names, Docker images, and versions.
+To call a tool, output a line in this format:
+[TOOL_CALL: tool_name("argument")]
+
+Available tools:
+- search_docker_hub("query") - Search Docker Hub for images. Returns name, description, stars, official status.
+- get_docker_tags("image") - Get available tags for a Docker image (e.g., "nginx", "portainer/portainer-ce").
+- search_packages("query") - Search system package manager (apt, dnf, etc.) for packages.
+- get_package_info("package") - Get details about a specific package (version, dependencies, size).
+- get_github_releases("owner/repo") - Get latest releases from a GitHub repository.
+- search_snaps("query") - Search Snap Store for packages.
+- get_pypi_info("package") - Get Python package info from PyPI.
+
+WHEN TO USE TOOLS:
+- Use search_docker_hub when you need to find the correct Docker image name
+- Use get_docker_tags to find the latest or LTS tag for an image
+- Use search_packages when unsure of exact package name
+- Use get_github_releases for software installed from GitHub
+
+After receiving tool results, incorporate them into your final JSON response.
+If you don't need any tools, output your JSON response directly.
+"""
+
+    def __init__(self, llm: LLMInterface, tools: Optional['InstallerTools'] = None):
         self.llm = llm
+        self.tools = tools
+        self._max_tool_iterations = 3  # Prevent infinite loops
+        self._measured_speed_mbps: Optional[float] = None  # Cache measured speed
+        self._speed_test_attempted = False  # Track if we've already tested
+        self._current_system_info: Optional['SystemInfo'] = None  # Reference to current system info
+
+    def _test_internet_speed(self) -> float:
+        """
+        Test internet speed by downloading a small file.
+        Returns speed in Mbps. Falls back to 10 Mbps if test fails.
+        
+        Uses reliable endpoints that return small responses.
+        Timeout is short to avoid blocking long.
+        """
+        if self._speed_test_attempted:
+            return self._measured_speed_mbps or 10.0
+        
+        self._speed_test_attempted = True
+        
+        try:
+            import urllib.request
+            import time
+            
+            # Test URLs that are reliable and return small/medium responses
+            # These are used just to measure latency and basic speed
+            test_urls = [
+                ("https://api.github.com/status", 3),      # GitHub API (returns ~500 bytes)
+                ("https://registry-1.docker.io/v2/", 2),   # Docker Registry API (returns small JSON)
+                ("https://pypi.org/pypi", 2),              # PyPI simple (returns HTML)
+            ]
+            
+            best_speed = None
+            
+            for url, timeout in test_urls:
+                try:
+                    start_time = time.time()
+                    
+                    req = urllib.request.Request(url, headers={'User-Agent': 'AI-Installer/1.0'})
+                    with urllib.request.urlopen(req, timeout=timeout) as response:
+                        data = response.read()
+                        elapsed_time = time.time() - start_time
+                        
+                        if elapsed_time > 0.01 and len(data) > 100:  # Need reasonable elapsed time
+                            # Calculate speed in Mbps
+                            data_size_mb = len(data) / (1024 * 1024)
+                            speed_mbps = (data_size_mb * 8) / elapsed_time
+                            
+                            # Sanity checks: between 0.1 Mbps and 10 Gbps
+                            if 0.1 <= speed_mbps <= 10000:
+                                best_speed = speed_mbps
+                                print(f"  [Speed Test] {speed_mbps:.1f} Mbps")
+                                break  # Got a good measurement
+                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+                    # Try next URL
+                    continue
+                except Exception:
+                    # Unexpected error, try next URL
+                    continue
+            
+            if best_speed:
+                self._measured_speed_mbps = best_speed
+                return best_speed
+            else:
+                # Could not measure, use default
+                self._measured_speed_mbps = 10.0
+                return 10.0
+                
+        except Exception as e:
+            # Complete failure, use default
+            self._measured_speed_mbps = 10.0
+            return 10.0
+
+    def _get_download_speed(self) -> float:
+        """
+        Get the user's internet speed for download time estimates.
+
+        Priority:
+        1. Use speed already measured by SystemAnalyzer (stored in system_info)
+        2. Use cached speed from previous call
+        3. Run our own speed test with timeout
+
+        Returns speed in Mbps. Defaults to 10 Mbps if test takes too long.
+        """
+        # First check if SystemAnalyzer already measured the speed (preferred - uses curl)
+        if self._current_system_info and self._current_system_info.measured_internet_speed_mbps:
+            speed = self._current_system_info.measured_internet_speed_mbps
+            if speed > 0:
+                self._measured_speed_mbps = speed
+                self._speed_test_attempted = True
+                return speed
+
+        # Return cached result if we already tested
+        if self._speed_test_attempted:
+            return self._measured_speed_mbps or 10.0
+
+        # Fallback: run our own speed test (urllib-based)
+        try:
+            import threading
+
+            # Run speed test in a separate thread with timeout
+            # This prevents the test from hanging the installation process
+            result = [10.0]  # Default result
+
+            def run_test():
+                try:
+                    result[0] = self._test_internet_speed()
+                except Exception:
+                    result[0] = 10.0
+
+            test_thread = threading.Thread(target=run_test, daemon=True)
+            test_thread.start()
+            test_thread.join(timeout=15)  # Wait max 15 seconds for speed test
+
+            # If thread is still alive, it timed out
+            if test_thread.is_alive():
+                print("  [Speed Test] Timeout (>15s), using default 10 Mbps")
+                self._speed_test_attempted = True
+                self._measured_speed_mbps = 10.0
+                return 10.0
+
+            return result[0]
+
+        except Exception:
+            # If anything goes wrong, just use default
+            self._speed_test_attempted = True
+            self._measured_speed_mbps = 10.0
+            return 10.0
+
+    # =========================================================================
+    # Native Package Manager Integration (apt, apk, pacman, etc.)
+    # =========================================================================
+
+    def _is_native_package_request(self, software_request: str) -> bool:
+        """Check if the user is requesting installation of native system packages"""
+        native_keywords = [
+            'apt', 'apt-get', 'apk', 'pacman', 'dnf', 'yum', 'zypper',
+            'pip', 'npm', 'cargo', 'gem',
+        ]
+        
+        request_lower = software_request.lower()
+        return any(keyword in request_lower for keyword in native_keywords)
+
+    def _extract_package_names_from_request(self, software_request: str) -> list[str]:
+        """Extract potential package names from the software request"""
+        import re
+        
+        packages = []
+        request_lower = software_request.lower()
+        
+        # Extract explicit package references
+        # Patterns: "install package-name", "install numpy", "apt install curl", etc.
+        patterns = [
+            r'(?:install|apt|apk|pacman|dnf|npm|pip|cargo)\s+([a-z0-9\-]+)',
+            r'\b([a-z0-9\-]+)\b(?:\s+package)?',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, request_lower)
+            for match in matches:
+                if match not in ['install', 'package', 'using', 'via', 'with']:
+                    packages.append(match)
+        
+        # Also support direct software name if it's not Docker-related
+        if not self._is_docker_container_request(software_request):
+            # Extract the main software name (usually the first significant word)
+            words = request_lower.split()
+            for word in words:
+                if word not in ['install', 'setup', 'deploy', 'configure', 'using', 'with', 'please']:
+                    if len(word) > 2 and word.isalnum() or '-' in word:
+                        if word not in packages:
+                            packages.append(word)
+                        break
+        
+        return list(set(packages))[:5]  # Remove duplicates and limit to 5
+
+    def _check_package_status(self, package_name: str, system_info: SystemInfo) -> dict:
+        """
+        Check if a package is already installed or has stale versions.
+        Returns status, version, and recommendations.
+        """
+        try:
+            status = {
+                "name": package_name,
+                "installed": False,
+                "version": None,
+                "installed_version": None,
+                "available_version": None,
+                "has_update": False,
+                "conflict_warning": "",
+                "recommendation": "",
+            }
+            
+            # Check if package is in installed packages
+            if package_name in system_info.installed_packages:
+                status["installed"] = True
+            
+            # Try to get version info from package manager
+            if self.tools:
+                try:
+                    pkg_info = self.tools.get_package_info(package_name)
+                    if pkg_info.success:
+                        data = pkg_info.data
+                        if "version" in data:
+                            status["available_version"] = data["version"]
+                        
+                        if status["installed"] and "installed_version" in data:
+                            status["installed_version"] = data["installed_version"]
+                            if status["installed_version"] != status["available_version"]:
+                                status["has_update"] = True
+                except:
+                    pass
+            
+            # Generate recommendations
+            if status["installed"]:
+                status["recommendation"] = f"Package '{package_name}' is already installed"
+                if status["has_update"]:
+                    status["conflict_warning"] = f"UPDATE AVAILABLE: {status['installed_version']} → {status['available_version']}"
+                    status["recommendation"] += "\nConsider updating to the latest version before proceeding"
+            else:
+                status["recommendation"] = f"Package '{package_name}' is not installed and ready for installation"
+            
+            return status
+        except Exception as e:
+            return {
+                "name": package_name,
+                "installed": False,
+                "version": None,
+                "installed_version": None,
+                "available_version": None,
+                "has_update": False,
+                "conflict_warning": "",
+                "recommendation": f"Could not determine package status: {str(e)}",
+            }
+
+    def _fetch_package_size_and_deps(self, package_name: str) -> dict:
+        """
+        Fetch package size and dependencies from package manager.
+        Returns size in MB, dependency count, and estimated download time.
+        """
+        try:
+            size_mb = 0.0
+            dep_count = 0
+            
+            if not self.tools:
+                return {
+                    "package": package_name,
+                    "size_mb": 0.0,
+                    "dependency_count": 0,
+                    "download_time_seconds": 0.0,
+                    "download_time_minutes": 0.0,
+                }
+            
+            # Get package info from package manager
+            try:
+                pkg_info = self.tools.get_package_info(package_name)
+                if pkg_info.success:
+                    data = pkg_info.data
+                    raw = data.get("raw", "")
+                    
+                    # Try to parse size from apt-cache output
+                    import re
+                    
+                    # apt-cache format: "Size: 12345" (in bytes or KB)
+                    size_match = re.search(r'(?:Size|size):\s*(\d+(?:\.\d+)?)\s*([KMG]?B)?', raw)
+                    if size_match:
+                        size_val = float(size_match.group(1))
+                        size_unit = size_match.group(2) or "B"
+                        
+                        # Convert to MB
+                        if "KB" in size_unit:
+                            size_mb = size_val / 1024
+                        elif "MB" in size_unit:
+                            size_mb = size_val
+                        elif "GB" in size_unit:
+                            size_mb = size_val * 1024
+                        else:
+                            size_mb = size_val / (1024 * 1024)  # bytes to MB
+                    
+                    # Count dependencies
+                    depends_match = re.search(r'Depends:\s*(.+?)(?=\n|$)', raw)
+                    if depends_match:
+                        deps_str = depends_match.group(1)
+                        # Count comma-separated dependencies
+                        dep_count = len([d.strip() for d in deps_str.split(",") if d.strip()])
+            except:
+                pass
+            
+            # Calculate download time at user's measured speed
+            download_speed_mbps = self._get_download_speed()
+            download_time_seconds = (size_mb * 8) / download_speed_mbps if download_speed_mbps and size_mb > 0 else 0
+            
+            return {
+                "package": package_name,
+                "size_mb": round(size_mb, 2),
+                "dependency_count": dep_count,
+                "download_time_seconds": round(download_time_seconds, 1),
+                "download_time_minutes": round(download_time_seconds / 60, 2),
+            }
+        except Exception:
+            return {
+                "package": package_name,
+                "size_mb": 0.0,
+                "dependency_count": 0,
+                "download_time_seconds": 0.0,
+                "download_time_minutes": 0.0,
+            }
+
+    def _build_native_package_metadata_section(self, packages: list[str], system_info: SystemInfo) -> str:
+        """Build a section with fresh package manager data for the prompt"""
+        if not packages or not self.tools:
+            return ""
+        
+        section = "\n\nFRESH NATIVE PACKAGE DATA:\n"
+        section += "The following system packages are relevant to this installation.\n"
+        section += "Check status, sizes, and available updates:\n\n"
+        
+        has_conflicts = False
+        conflict_warnings = []
+        main_package_installed = False
+        main_package_name = packages[0] if packages else ""
+        
+        for i, package in enumerate(packages[:5]):  # Limit to 5 packages
+            status = self._check_package_status(package, system_info)
+            size_info = self._fetch_package_size_and_deps(package)
+            
+            # Track if main package (first one) is already installed
+            if i == 0 and status["installed"]:
+                main_package_installed = True
+            
+            # Status indicator
+            status_indicator = "✓ INSTALLED" if status["installed"] else "✗ NOT INSTALLED"
+            if status["conflict_warning"]:
+                status_indicator += f" - {status['conflict_warning']}"
+                has_conflicts = True
+                conflict_warnings.append(status["conflict_warning"])
+            
+            section += f"--- Package: {package} ---\n"
+            section += f"  Status: {status_indicator}\n"
+            
+            # Size info
+            if size_info["size_mb"] > 0:
+                download_time = size_info["download_time_minutes"]
+                measured_speed = self._get_download_speed()
+                section += f"  Size: {size_info['size_mb']:.1f} MB | Download: ~{download_time:.0f}s @ {measured_speed:.1f} Mbps"
+                if size_info["dependency_count"] > 0:
+                    section += f" | Dependencies: {size_info['dependency_count']}"
+                section += "\n"
+            
+            section += f"  Note: {status['recommendation']}\n\n"
+        
+        # Add conflict warning to end if needed
+        if has_conflicts:
+            section += "⚠ CONFLICT WARNINGS:\n"
+            for warning in conflict_warnings:
+                section += f"  - {warning}\n"
+            section += "The installation plan should include steps to handle these conflicts.\n\n"
+        
+        # If main package is already installed, add special instruction for Agent
+        if main_package_installed and main_package_name:
+            section += f"\nIMPORTANT: The requested package '{main_package_name}' is ALREADY INSTALLED on this system.\n"
+            section += "Include in your installation plan a prompt asking the user if they want to:\n"
+            section += f"  1. Keep the existing installation (skip reinstall)\n"
+            section += f"  2. Remove the existing installation first, then reinstall\n"
+            section += "Phrase the question as: 'The software requested already exists on your system. Do you want me to include a removal/purge before installing again?'\n"
+            section += "This allows the user to respond with either:\n"
+            section += "  - 'Can you remove the previous installation' (to trigger reinstall after removal)\n"
+            section += "  - 'Continue' (to skip reinstall and keep existing version)\n\n"
+        
+        return section
+
+    def _is_docker_container_request(self, software_request: str) -> bool:
+        """Check if the user is requesting a Docker container installation"""
+        docker_keywords = [
+            'docker', 'container', 'compose', 'image',
+            'portainer', 'nextcloud', 'jellyfin', 'sonarr', 'plex',
+            'grafana', 'prometheus', 'gitlab', 'registry', 'nginx proxy',
+            'traefik', 'caddy', 'keycloak', 'influxdb', 'grafana',
+        ]
+        
+        request_lower = software_request.lower()
+        return any(keyword in request_lower for keyword in docker_keywords)
+
+    def _fetch_docker_layer_sizes(self, image_name: str, tag: str = "latest") -> dict:
+        """
+        Fetch layer sizes for a Docker image from Docker Hub API.
+        Returns total size, layer count, and estimated download time.
+        
+        Docker Hub API: GET /v2/repositories/{namespace}/{repository}/tags
+        """
+        if not self.tools:
+            return {}
+        
+        try:
+            # Handle namespace/image split
+            if "/" in image_name:
+                namespace, repo = image_name.split("/", 1)
+            else:
+                namespace = "library"  # Official images use 'library' namespace
+                repo = image_name
+            
+            # Use the session from InstallerTools which has requests available
+            session = self.tools._get_session()
+            
+            # Query Docker Hub API for tags with size information
+            url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags/?ordering=-last_updated&page_size=20"
+            
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get('results', [])
+            
+            total_size_bytes = 0
+            layer_count = 0
+            found_tag = False
+            
+            # Find the specific tag or use latest
+            for tag_info in results:
+                if tag_info.get('name') == tag:
+                    found_tag = True
+                    # full_size is the total compressed size
+                    total_size_bytes = tag_info.get('full_size', 0)
+                    # Count the images/architectures as layers
+                    images = tag_info.get('images', [])
+                    layer_count = len(images) if images else 0
+                    break
+            
+            # If tag not found, use the first (most recent) - typically 'latest'
+            if not found_tag and results:
+                total_size_bytes = results[0].get('full_size', 0)
+                images = results[0].get('images', [])
+                layer_count = len(images) if images else 0
+            
+            # Convert bytes to MB
+            total_size_mb = total_size_bytes / (1024 * 1024) if total_size_bytes else 0
+            
+            # Get user's actual internet speed for more accurate estimate
+            download_speed_mbps = self._get_download_speed()
+            download_time_seconds = (total_size_mb * 8) / download_speed_mbps if download_speed_mbps and total_size_mb else 0
+            
+            return {
+                "total_size_mb": round(total_size_mb, 2),
+                "layer_count": layer_count,
+                "download_time_seconds": round(download_time_seconds, 1),
+                "download_time_minutes": round(download_time_seconds / 60, 2),
+            }
+            
+        except Exception as e:
+            # API unavailable, return empty
+            return {}
+
+    def _fetch_docker_image_metadata(self, image_name: str) -> dict:
+        """
+        Fetch fresh metadata for a Docker image from Docker Hub API.
+        Returns tags, description, stars, official status, layer sizes, etc.
+        """
+        if not self.tools:
+            return {}
+        
+        try:
+            # Get basic image info
+            result = self.tools.search_docker_hub(image_name, limit=1)
+            if result.success and result.data:
+                # search_docker_hub returns {"images": [...], "query": ..., "count": ...}
+                images = result.data.get("images", [])
+                if not images:
+                    return {}
+                image_info = images[0]
+                
+                # Get available tags (very useful for choosing versions)
+                tags_result = self.tools.get_docker_tags(image_name, limit=10)
+                # get_docker_tags returns {"image": ..., "tags": [...]}
+                tags_list = tags_result.data.get("tags", []) if tags_result.success else []
+                # Extract just the tag names for easier display
+                tag_names = [tag.get("name", "") for tag in tags_list] if isinstance(tags_list, list) else []
+                
+                # Get layer sizes for latest tag
+                layer_data = self._fetch_docker_layer_sizes(image_name, "latest")
+                
+                return {
+                    "name": image_info.get("name", image_name),
+                    "description": image_info.get("description", ""),
+                    "official": image_info.get("official", False),
+                    "stars": image_info.get("stars", 0),
+                    "pulls": image_info.get("pull_count", 0),
+                    "tags": tag_names,
+                    "latest_tag": "latest",
+                    "size_mb": layer_data.get("total_size_mb", 0),
+                    "layer_count": layer_data.get("layer_count", 0),
+                    "download_time_seconds": layer_data.get("download_time_seconds", 0),
+                    "download_time_minutes": layer_data.get("download_time_minutes", 0),
+                }
+        except Exception as e:
+            print(f"  [Docker API] Error fetching metadata for {image_name}: {e}")
+            return {}
+
+    def _extract_docker_images_from_request(self, software_request: str) -> list[str]:
+        """Extract potential Docker image names from the software request"""
+        import re
+        
+        images = []
+        request_lower = software_request.lower()
+        
+        # First, check for common software that maps to Docker images
+        # This is more reliable than regex extraction
+        docker_mappings = {
+            'nextcloud': 'nextcloud',
+            'jellyfin': 'jellyfin/jellyfin',
+            'plex': 'plexinc/pms-docker',
+            'sonarr': 'linuxserver/sonarr',
+            'radarr': 'linuxserver/radarr',
+            'portainer': 'portainer/portainer-ce',
+            'grafana': 'grafana/grafana',
+            'prometheus': 'prom/prometheus',
+            'nginx': 'nginx',
+            'postgres': 'postgres',
+            'postgresql': 'postgres',
+            'mysql': 'mysql',
+            'mongodb': 'mongo',
+            'mongo': 'mongo',
+            'redis': 'redis',
+            'elasticsearch': 'docker.elastic.co/elasticsearch/elasticsearch',
+            'minio': 'minio/minio',
+            'vault': 'vault',
+            'consul': 'consul',
+            'dnsmasq': 'jpillora/dnsmasq',
+            'unifi': 'linuxserver/unifi-controller',
+        }
+        
+        for software, docker_image in docker_mappings.items():
+            if software in request_lower:
+                images.append(docker_image)
+        
+        # Also try to extract explicit Docker image references (e.g., "docker run ubuntu:latest")
+        # Look for patterns like: name/image:tag or just image:tag
+        image_patterns = [
+            r'(?:run|pull|image|docker)\s+([\w.-]+/[\w.-]+(?::[\w.-]+)?)',  # user/image:tag after run/pull/image/docker
+            r'\b([\w.-]+/[\w.-]+(?::[\w.-]+)?)\b',  # user/image:tag format (word boundaries)
+        ]
+        
+        for pattern in image_patterns:
+            matches = re.findall(pattern, request_lower)
+            for match in matches:
+                # Filter out common English words that might match
+                if match not in ['docker', 'install', 'setup', 'run', 'with', 'using']:
+                    images.append(match)
+        
+        return list(set(images))  # Remove duplicates
+
+    def _build_docker_metadata_section(self, images: list[str]) -> str:
+        """Build a section with fresh Docker metadata for the prompt"""
+        if not images or not self.tools:
+            return ""
+        
+        section = "\n\nFRESH DOCKER HUB DATA:\n"
+        section += "The following Docker images are relevant to this installation.\n"
+        
+        # Get measured internet speed
+        measured_speed = self._get_download_speed()
+        if self._speed_test_attempted:
+            section += f"(Based on your internet speed: {measured_speed:.1f} Mbps)\n"
+        section += "Use these official images and versions:\n\n"
+        
+        for image in images[:5]:  # Limit to 5 images
+            metadata = self._fetch_docker_image_metadata(image)
+            if metadata:
+                section += f"--- Image: {metadata.get('name', image)} ---\n"
+                if metadata.get('official'):
+                    section += "  [OFFICIAL IMAGE]\n"
+                section += f"  Description: {metadata.get('description', 'N/A')[:200]}\n"
+                section += f"  Stars: {metadata.get('stars', 0)} | Pulls: {metadata.get('pulls', 0)}\n"
+                
+                # Add download time estimate if available
+                size_mb = metadata.get('size_mb', 0)
+                download_minutes = metadata.get('download_time_minutes', 0)
+                layer_count = metadata.get('layer_count', 0)
+                if size_mb > 0:
+                    section += f"  Size: {size_mb:.1f} MB | Download: ~{download_minutes:.0f} min @ {measured_speed:.1f} Mbps | Layers: {layer_count}\n"
+                
+                if metadata.get('tags'):
+                    latest_tags = metadata['tags'][:5]
+                    section += f"  Available versions: {', '.join(latest_tags)}\n"
+                section += f"  Usage: docker pull {image}:latest\n\n"
+        
+        return section
 
     def analyze_requirements(self,
                             system_info: SystemInfo,
                             software_request: str,
                             web_docs: Optional[dict] = None) -> dict:
-        """Analyze what's needed to install the requested software"""
+        """Analyze what's needed to install the requested software.
+
+        If InstallerTools is available, runs an agent loop that allows the model
+        to request tool calls to find exact package names, Docker images, etc.
+        """
+        # Store reference to system_info for _get_download_speed() to use
+        # This allows us to use the speed already measured by SystemAnalyzer
+        self._current_system_info = system_info
 
         # Get installed packages as a clear list for the prompt
         installed_pkgs = system_info.installed_packages if hasattr(system_info, 'installed_packages') else []
@@ -1387,53 +3101,112 @@ You have deep knowledge of:
                 web_docs_section += f"--- Source: {doc['title']} ---\n"
                 web_docs_section += f"URL: {doc['url']}\n"
                 web_docs_section += f"{doc['content'][:4000]}\n\n"
+        
+        # Check if this is a Docker container request and fetch fresh Docker data
+        docker_metadata_section = ""
+        if self._is_docker_container_request(software_request):
+            images = self._extract_docker_images_from_request(software_request)
+            if images:
+                docker_metadata_section = self._build_docker_metadata_section(images)
+                # Store measured internet speed in system_info for GUI display
+                if self._measured_speed_mbps is not None:
+                    system_info.measured_internet_speed_mbps = self._measured_speed_mbps
 
-        prompt = f"""
-Analyze the following system and determine what's needed to install the requested software.
+        # Check if this is a native package request and fetch fresh package data
+        native_package_section = ""
+        if self._is_native_package_request(software_request):
+            packages = self._extract_package_names_from_request(software_request)
+            if packages:
+                native_package_section = self._build_native_package_metadata_section(packages, system_info)
 
-SYSTEM INFORMATION:
-{json.dumps(system_info.to_dict(), indent=2)}
+        # Build simple system string matching training format
+        os_info = f"{system_info.distro_name} {system_info.distro_version}"
+        if system_info.is_wsl:
+            os_info += " (WSL2)"
+        os_info += f" {system_info.architecture}"
 
-ALREADY INSTALLED PACKAGES (use this to determine prerequisite status):
-{json.dumps(installed_pkgs, indent=2)}
+        # Enhance request for clarity (small models need explicit instructions)
+        enhanced_request = software_request
+        request_lower = software_request.lower().strip()
 
-SOFTWARE REQUEST:
-{software_request}
+        # Detect Docker Engine installation vs Docker-based app
+        if request_lower in ("install docker", "setup docker", "docker"):
+            enhanced_request = "Install Docker Engine itself (not a container). Install docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin"
+        elif request_lower in ("install nginx", "nginx", "setup nginx"):
+            enhanced_request = "Install nginx web server using apt"
+        elif request_lower in ("install python", "python", "setup python"):
+            enhanced_request = "Install Python 3 and pip using apt"
+
+        # Build system prompt with tool descriptions if tools are available
+        system_prompt = self.SYSTEM_PROMPT
+        if self.tools:
+            system_prompt += self.TOOL_DESCRIPTIONS
+
+        prompt = f"""SYSTEM: {os_info}
+REQUEST: {enhanced_request}
 {web_docs_section}
-IMPORTANT: When filling out "prerequisites", check the ALREADY INSTALLED PACKAGES list above.
-- If a package (like "curl", "gnupg", "gnupg2", "git", etc.) appears in that list, set status to "installed"
-- Only set status to "missing" if the package is NOT in the installed packages list
-- If web documentation is provided above, PRIORITIZE those installation commands over your training data
+{docker_metadata_section}
+{native_package_section}
+Respond with a JSON object containing: compatible, software_name, prerequisites, installation_steps, configuration, warnings, post_install_tests, and optionally ask_about_removal (set to true if you need to ask the user about removing an existing installation before proceeding)."""
 
-Respond with a JSON object containing:
-{{
-    "compatible": true/false,
-    "compatibility_issues": ["list of blocking issues if not compatible"],
-    "software_name": "Human-readable name of the software being installed (e.g., 'Portainer', 'Nginx', 'PostgreSQL')",
-    "prerequisites": [
-        {{"name": "...", "status": "installed|missing|outdated", "required_version": "...", "current_version": "..."}}
-    ],
-    "installation_steps": [
-        {{"step": 1, "description": "...", "commands": ["cmd1", "cmd2"], "requires_sudo": true/false, "risk_level": "low|medium|high"}}
-    ],
-    "configuration": {{
-        "ports": ["list of ports this software will use, e.g., 9443, 8080"],
-        "data_directory": "primary data directory path",
-        "config_files": ["list of config file paths if any"]
-    }},
-    "estimated_time_minutes": 10,
-    "disk_space_required_gb": 5,
-    "warnings": ["any important warnings"],
-    "post_install_tests": [
-        {{"name": "test name", "command": "test command", "expected_output_contains": "success string"}}
-    ]
-}}
+        # Agent loop with tool support
+        conversation_context = ""
+        for iteration in range(self._max_tool_iterations + 1):
+            full_prompt = prompt + conversation_context
+            response = self.llm.query(system_prompt, full_prompt)
 
-Be thorough and precise. Include all necessary steps for a complete installation.
-"""
+            # Check if response contains tool calls
+            if self.tools:
+                tool_calls = self._parse_tool_calls(response)
+                if tool_calls and iteration < self._max_tool_iterations:
+                    # Execute tools and add results to context
+                    tool_results = self._execute_tool_calls(tool_calls)
+                    conversation_context += f"\n\nPREVIOUS RESPONSE:\n{response}\n\nTOOL RESULTS:\n{tool_results}\n\nNow provide your final JSON response incorporating these tool results."
+                    continue
 
-        response = self.llm.query(self.SYSTEM_PROMPT, prompt)
+            # No tool calls or max iterations reached - parse final response
+            break
+
         return self._parse_json_response(response)
+
+    def _parse_tool_calls(self, response: str) -> list[tuple]:
+        """Parse tool calls from model response.
+
+        Looks for patterns like: [TOOL_CALL: tool_name("argument")]
+        Returns list of (tool_name, argument) tuples.
+        """
+        tool_calls = []
+        pattern = r'\[TOOL_CALL:\s*(\w+)\s*\(\s*["\']([^"\']+)["\']\s*\)\s*\]'
+
+        for match in re.finditer(pattern, response):
+            tool_name = match.group(1)
+            argument = match.group(2)
+            tool_calls.append((tool_name, argument))
+
+        return tool_calls
+
+    def _execute_tool_calls(self, tool_calls: list[tuple]) -> str:
+        """Execute tool calls and return formatted results."""
+        if not self.tools:
+            return "No tools available."
+
+        results = []
+        for tool_name, argument in tool_calls:
+            try:
+                # Map tool names to InstallerTools methods
+                tool_method = getattr(self.tools, tool_name, None)
+                if tool_method and callable(tool_method):
+                    result = tool_method(argument)
+                    if result.success:
+                        results.append(f"[{tool_name}(\"{argument}\")] SUCCESS:\n{json.dumps(result.data, indent=2)}")
+                    else:
+                        results.append(f"[{tool_name}(\"{argument}\")] ERROR: {result.error}")
+                else:
+                    results.append(f"[{tool_name}(\"{argument}\")] ERROR: Unknown tool '{tool_name}'")
+            except Exception as e:
+                results.append(f"[{tool_name}(\"{argument}\")] ERROR: {str(e)}")
+
+        return "\n\n".join(results) if results else "No tool results."
 
     def modify_plan(self,
                    current_plan: dict,
@@ -1497,12 +3270,31 @@ Respond with the COMPLETE modified plan in the same JSON format:
                        web_docs: Optional[dict] = None) -> str:
         """Answer a user's question about the installation plan"""
 
-        # Build context from web docs if available
+        question_lower = question.lower()
+
+        # Check if this is a port conflict question - answer directly from system info
+        if any(kw in question_lower for kw in ['port conflict', 'port conflicts', 'ports in use', 'port already']):
+            return self._answer_port_conflict_question(current_plan, system_info)
+
+        # Check if this is a size/resource question - answer from plan metrics
+        size_keywords = ['how large', 'how big', 'size', 'download size', 'disk space', 'how much space', 'storage']
+        if any(kw in question_lower for kw in size_keywords):
+            return self._answer_size_question(current_plan)
+
+        # Check if this is a system-info question that doesn't need web docs
+        system_info_keywords = [
+            'my system', 'my gpu', 'my cpu', 'installed', 'what version',
+            'disk space', 'memory', 'ram', 'wsl', 'gpu', 'cuda', 'driver'
+        ]
+        needs_web_docs = not any(kw in question_lower for kw in system_info_keywords)
+
+        # Build context from web docs only if needed
         web_context = ""
-        if web_docs and web_docs.get("fetched_docs"):
+        if needs_web_docs and web_docs and web_docs.get("fetched_docs"):
             web_context = "\n\nWEB DOCUMENTATION AVAILABLE:\n"
             for doc in web_docs["fetched_docs"][:2]:
-                web_context += f"Source: {doc['title']}\n{doc['content'][:2000]}\n\n"
+                # Limit content to reduce noise
+                web_context += f"Source: {doc['title']}\n{doc['content'][:1500]}\n\n"
 
         prompt = f"""
 You are an AI Installation Agent having a conversation with a user. You will be executing the installation on their behalf - the user does NOT need to run any commands manually.
@@ -1523,19 +3315,196 @@ USER'S QUESTION:
 {question}
 
 Please answer the user's question. Key points:
-1. Answer the specific question asked
-2. When discussing configuration options or flags, remind the user they can simply ASK you to make changes
-3. DO NOT give instructions like "add -e FLAG=value to your docker run command" - instead say "If you'd like to set FLAG, just tell me and I'll update the configuration"
-4. Frame everything as "I can do this for you" rather than "you need to do this"
-5. Be conversational and helpful
-
-Example good response style:
-"Open WebUI supports several environment variables like OPENAI_API_KEY, MODEL_NAME, and TEMPERATURE. If you'd like me to configure any of these, just let me know - for example, say 'set OPENAI_API_KEY to sk-xxx' and I'll update the installation plan for you."
+1. Answer the SPECIFIC question asked - do not provide general installation instructions
+2. Use the SYSTEM INFORMATION above to answer questions about the user's system
+3. When discussing configuration options or flags, remind the user they can simply ASK you to make changes
+4. DO NOT give instructions like "add -e FLAG=value to your docker run command" - instead say "If you'd like to set FLAG, just tell me and I'll update the configuration"
+5. Frame everything as "I can do this for you" rather than "you need to do this"
+6. Be concise and directly answer what was asked
 
 Respond with just the answer text (not JSON).
-"""
 
-        return self.llm.query(self.SYSTEM_PROMPT, prompt)
+/no_think"""
+
+        # Note: /no_think suffix tells Qwen3 to skip reasoning chain for faster Q&A responses
+        # This is intentional - Q&A doesn't need deep reasoning like installation planning does
+        response = self.llm.query(self.SYSTEM_PROMPT, prompt)
+
+        # Clean up response - model sometimes echoes prompt or adds extra content
+        response = self._clean_conversational_response(response)
+
+        return response
+
+    def _answer_port_conflict_question(self, current_plan: dict, system_info: SystemInfo) -> str:
+        """Directly answer port conflict questions using system info"""
+        ports_in_use = system_info.ports_in_use if hasattr(system_info, 'ports_in_use') else []
+        config = current_plan.get("configuration", {})
+        plan_ports = config.get("ports", [])
+
+        if not plan_ports:
+            return "This installation doesn't appear to use any specific ports, so there are no port conflicts to worry about."
+
+        conflicts = []
+        for port in plan_ports:
+            # Handle port as int or string
+            port_num = int(port) if isinstance(port, (int, str)) and str(port).isdigit() else None
+            if port_num and port_num in ports_in_use:
+                conflicts.append(port_num)
+
+        if conflicts:
+            conflict_str = ", ".join(str(p) for p in conflicts)
+            return (
+                f"Yes, there are port conflicts! The following ports are already in use on your system: {conflict_str}. "
+                f"You should either stop the services using these ports or ask me to change the ports. "
+                f"For example, say 'change port {conflicts[0]} to {conflicts[0] + 1000}' and I'll update the configuration."
+            )
+        else:
+            plan_ports_str = ", ".join(str(p) for p in plan_ports)
+            return (
+                f"No port conflicts detected. The installation will use port(s) {plan_ports_str}, "
+                f"and none of these are currently in use on your system."
+            )
+
+    def _answer_size_question(self, current_plan: dict) -> str:
+        """Directly answer size/resource questions using plan metrics"""
+        metrics = current_plan.get("_real_metrics", {})
+        breakdown = current_plan.get("_metrics_breakdown", {})
+
+        if not metrics and not breakdown:
+            return "I don't have detailed size information for this installation yet. The plan should show resource requirements after it's fully generated."
+
+        # Get values from metrics
+        download_mb = breakdown.get("download_size_mb", 0) + breakdown.get("docker_download_size_mb", 0)
+        disk_mb = breakdown.get("disk_space_mb", 0)
+        est_time = current_plan.get("estimated_time_minutes", 1)
+        packages_count = breakdown.get("packages_to_install", 0)
+        docker_count = breakdown.get("docker_images_to_pull", 0)
+
+        parts = []
+
+        if download_mb > 0:
+            if download_mb >= 1024:
+                parts.append(f"approximately {download_mb/1024:.1f} GB to download")
+            else:
+                parts.append(f"approximately {download_mb:.1f} MB to download")
+        elif packages_count > 0 or docker_count > 0:
+            parts.append("minimal download required (packages may already be cached)")
+
+        if disk_mb > 0:
+            if disk_mb >= 1024:
+                parts.append(f"{disk_mb/1024:.1f} GB of disk space")
+            else:
+                parts.append(f"{disk_mb:.1f} MB of disk space")
+
+        if packages_count > 0:
+            parts.append(f"{packages_count} package(s) to install")
+
+        if docker_count > 0:
+            parts.append(f"{docker_count} Docker image(s) to pull")
+
+        if not parts:
+            return f"This installation is lightweight with minimal resource requirements. Estimated time: ~{est_time} minute(s)."
+
+        response = "This installation requires " + ", ".join(parts) + f". Estimated time: ~{est_time} minute(s)."
+        return response
+
+    def _clean_conversational_response(self, response: str) -> str:
+        """
+        Clean up conversational responses from the model.
+
+        The model sometimes:
+        1. Echoes back the prompt template
+        2. Adds JSON after text
+        3. Includes system instructions
+        4. Regurgitates scraped web content
+
+        This extracts just the actual answer.
+        """
+        if not response:
+            return response
+
+        # Common prompt echo patterns to truncate at
+        truncate_patterns = [
+            "You are an AI Installation Agent",
+            "IMPORTANT CONTEXT:",
+            "CURRENT INSTALLATION PLAN:",
+            "SYSTEM INFORMATION:",
+            "USER'S QUESTION:",
+            "Please answer the user's question",
+            "```json",
+            '{"compatible"',
+            '{"installation_steps"',
+        ]
+
+        # Web garbage patterns - indicate scraped content is being regurgitated
+        web_garbage_patterns = [
+            "Submitted by",
+            "Commenti",  # Italian for "Comments" - common in scraped content
+            "/ Comments",
+            "Posted on",
+            "Published on",
+            "Last updated:",
+            "Leave a comment",
+            "Reply to this",
+            "Share this",
+            "Related posts",
+            "Tags:",
+            "Categories:",
+            "Author:",
+            " ago)",  # timestamps like "(2 hours ago)"
+            "Copyright",
+            "All rights reserved",
+            "Privacy Policy",
+            "Terms of Service",
+        ]
+
+        # Date patterns that indicate web scraping (e.g., "Sun, 17/03/2024 - 14:33")
+        # Only truncate if this appears AFTER some actual content
+        date_garbage_patterns = [
+            r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\d{1,2}/\d{1,2}/\d{4}',  # Sun, 17/03/2024
+            r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}',
+        ]
+
+        # Find the earliest truncation point from simple patterns
+        truncate_at = len(response)
+        for pattern in truncate_patterns + web_garbage_patterns:
+            idx = response.find(pattern)
+            if idx > 0 and idx < truncate_at:  # > 0 means pattern found but not at start
+                truncate_at = idx
+
+        # Check date patterns with regex
+        for date_pattern in date_garbage_patterns:
+            match = re.search(date_pattern, response)
+            if match and match.start() > 50 and match.start() < truncate_at:
+                # Only truncate if date is after substantial content (>50 chars)
+                truncate_at = match.start()
+
+        # Truncate if we found a pattern
+        if truncate_at < len(response):
+            response = response[:truncate_at]
+
+        # Clean up trailing whitespace and newlines
+        response = response.strip()
+
+        # Remove common trailing artifacts
+        while response.endswith(('.', '!', '?')) is False and len(response) > 100:
+            # If response doesn't end with punctuation, it might be cut mid-sentence
+            # Try to find the last complete sentence
+            last_period = response.rfind('. ')
+            last_question = response.rfind('? ')
+            last_exclaim = response.rfind('! ')
+            last_punct = max(last_period, last_question, last_exclaim)
+            if last_punct > len(response) // 2:  # Only trim if we keep at least half
+                response = response[:last_punct + 1]
+                break
+            else:
+                break
+
+        # If response is empty after cleaning, provide a fallback
+        if not response:
+            return "I understand your question. Could you please rephrase it so I can give you a more specific answer?"
+
+        return response
 
     def troubleshoot(self,
                     system_info: SystemInfo,
@@ -1584,12 +3553,34 @@ Respond with a JSON object:
         - Trailing commas
         - Single quotes instead of double quotes
         - Control characters in strings
+        - Invalid field types (e.g., configuration as list instead of dict)
         """
+
+        def normalize_response(result: dict) -> dict:
+            """Normalize and validate the parsed response"""
+            if not isinstance(result, dict):
+                return result
+            
+            # Ensure configuration is always a dict, not a list
+            if "configuration" in result:
+                config = result["configuration"]
+                if isinstance(config, list):
+                    # Convert list to dict - try to extract meaningful data
+                    # If it's a list of strings, treat as ports or items
+                    # Otherwise create empty dict
+                    result["configuration"] = {}
+                elif not isinstance(config, dict):
+                    result["configuration"] = {}
+            else:
+                result.setdefault("configuration", {})
+            
+            return result
 
         def try_parse(text: str) -> Optional[dict]:
             """Attempt to parse JSON with error recovery"""
             try:
-                return json.loads(text)
+                parsed = json.loads(text)
+                return normalize_response(parsed) if isinstance(parsed, dict) else parsed
             except json.JSONDecodeError:
                 return None
 
@@ -2089,6 +4080,55 @@ class PlanEnhancer:
         # Extract packages from commands
         all_packages = self.extract_packages_from_commands(all_commands)
         self._log(f"Found {len(all_packages)} packages in commands")
+
+        # Also check prerequisites field for package names
+        prerequisites = plan.get("prerequisites", [])
+        for prereq in prerequisites:
+            if isinstance(prereq, str):
+                # Check if it looks like a package name (lowercase, with optional -devel or similar suffixes)
+                prereq_lower = prereq.lower().strip()
+                # Skip if it's a description rather than a package name
+                if ' ' not in prereq_lower and len(prereq_lower) < 50 and prereq_lower not in all_packages:
+                    all_packages.append(prereq_lower)
+                    self._log(f"Found package from prerequisites: {prereq_lower}")
+            elif isinstance(prereq, dict) and prereq.get("name"):
+                pkg_name = prereq["name"].lower().strip()
+                if pkg_name not in all_packages:
+                    all_packages.append(pkg_name)
+                    self._log(f"Found package from prerequisites: {pkg_name}")
+
+        # Fallback: if no packages found, try to infer from software_name
+        if not all_packages:
+            software_name = plan.get("software_name", "").lower()
+            # Common software-to-package mappings
+            software_package_map = {
+                "mysql": ["mysql-server"],
+                "mariadb": ["mariadb-server"],
+                "postgresql": ["postgresql"],
+                "postgres": ["postgresql"],
+                "nginx": ["nginx"],
+                "apache": ["apache2"],
+                "redis": ["redis-server"],
+                "mongodb": ["mongodb-org", "mongodb"],
+                "nodejs": ["nodejs", "npm"],
+                "node": ["nodejs", "npm"],
+                "python": ["python3", "python3-pip"],
+                "php": ["php", "php-fpm"],
+                "docker": ["docker-ce", "docker.io"],
+                "git": ["git"],
+                "curl": ["curl"],
+                "wget": ["wget"],
+                "htop": ["htop"],
+                "vim": ["vim"],
+                "nano": ["nano"],
+            }
+            for key, pkgs in software_package_map.items():
+                if key in software_name:
+                    for pkg in pkgs:
+                        if pkg not in all_packages:
+                            all_packages.append(pkg)
+                            self._log(f"Inferred package from software name: {pkg}")
+                    break
 
         # Get info for each package
         total_download = 0
@@ -2648,7 +4688,8 @@ class AIInstallationAgent:
         self.executor = CommandExecutor(dry_run=config.dry_run, verbose=config.verbose)
         self.test_runner = TestRunner(self.executor, verbose=config.verbose)
         self.plan_enhancer = PlanEnhancer(verbose=config.verbose)
-        self.web_searcher = WebSearcher(verbose=config.verbose) if config.web_search else None
+        # Always create WebSearcher - it handles offline detection automatically
+        self.web_searcher = WebSearcher(verbose=config.verbose)
 
         # Initialize LLM
         if config.llm_provider == LLMProvider.ANTHROPIC:
@@ -2673,10 +4714,18 @@ class AIInstallationAgent:
                     print(f"   ✅ {msg}")
                 else:
                     print(f"   ⚠️  {msg}")
+        elif config.llm_provider == LLMProvider.BUILTIN:
+            # Use AI Installer's own trained model - OFFLINE MODE!
+            # Model is loaded from ./models/ (static path)
+            llm = BuiltinLLM()
+            if config.verbose:
+                print("🧠 Using AI Installer's built-in model (offline mode)")
         else:
             raise ValueError(f"Unsupported LLM provider: {config.llm_provider}")
 
-        self.reasoner = InstallationReasoner(llm)
+        # Create tools for the reasoner (helps find packages, Docker images, etc.)
+        self.tools = InstallerTools()
+        self.reasoner = InstallationReasoner(llm, tools=self.tools)
         self.system_info: Optional[SystemInfo] = None
 
     def _print_header(self, msg: str):
@@ -3202,11 +5251,12 @@ class AIInstallationAgent:
                         error_msg = result.stderr or result.stdout or "Unknown error"
 
                         # Web search for solutions (Stack Overflow, GitHub issues, etc.)
+                        # WebSearcher handles offline detection automatically
                         web_context = ""
-                        if self.web_searcher or self.config.web_search:
+                        if self.web_searcher and self.web_searcher.is_online():
                             try:
                                 print("🔍 Searching web for solutions...")
-                                searcher = self.web_searcher or WebSearcher(verbose=self.config.verbose)
+                                searcher = self.web_searcher
                                 search_query = self._create_error_search_query(cmd, error_msg)
 
                                 if self.config.verbose:
@@ -3483,30 +5533,32 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Cloud providers
+  # Built-in model (DEFAULT - runs offline, no API key needed!)
+  %(prog)s "Install Docker"
+  %(prog)s "Install Nextcloud with Docker"
   %(prog)s "Install AMD ROCm 6.1 for WSL2"
+
+  # Specify custom model path
+  %(prog)s "Install Docker" --model-path ~/training/models/ai_installer_agent/merged
+
+  # Cloud providers (require API keys)
+  %(prog)s "Install Docker" --provider anthropic
   %(prog)s "Install CUDA toolkit 12.0" --provider openai
   %(prog)s "Install Docker" --provider gemini --model gemini-2.5-flash
 
   # Local LLM providers (OpenAI-compatible)
   %(prog)s "Install Docker" --provider local --local-preset lm-studio
   %(prog)s "Install Docker" --provider local --local-preset ollama --model llama3.1
-  %(prog)s "Install Docker" --provider local --base-url http://192.168.1.100:8080/v1 --model my-model
 
   # Dry run (test without executing)
   %(prog)s "Install Docker and docker-compose" --dry-run
 
-Supported cloud providers:
-  anthropic - Anthropic Claude (default)
-  openai    - OpenAI GPT
-  gemini    - Google Gemini (get API key: https://aistudio.google.com/apikey)
-
-Supported local providers (presets):
-  lm-studio      - LM Studio (default: localhost:1234)
-  ollama         - Ollama (default: localhost:11434)
-  localai        - LocalAI (default: localhost:8080)
-  text-gen-webui - text-generation-webui (default: localhost:5000)
-  vllm           - vLLM server (default: localhost:8000)
+Providers:
+  builtin   - AI Installer's trained model (default, offline, no API key!)
+  anthropic - Anthropic Claude (requires ANTHROPIC_API_KEY)
+  openai    - OpenAI GPT (requires OPENAI_API_KEY)
+  gemini    - Google Gemini (requires GEMINI_API_KEY)
+  local     - OpenAI-compatible servers (LM Studio, Ollama, etc.)
         """
     )
 
@@ -3514,13 +5566,13 @@ Supported local providers (presets):
 
     # Provider selection
     parser.add_argument("--provider", "-p",
-                       choices=["anthropic", "openai", "gemini", "local"],
-                       default="anthropic",
-                       help="LLM provider to use (default: anthropic)")
+                       choices=["builtin", "anthropic", "openai", "gemini", "local"],
+                       default="builtin",
+                       help="LLM provider: builtin (default, offline), anthropic, openai, gemini, local")
 
     # Model configuration
     parser.add_argument("--model", "-m",
-                       help="Model name to use")
+                       help="Model name to use (for cloud/local providers)")
 
     # Local LLM configuration
     local_group = parser.add_argument_group("Local LLM Options")
@@ -3556,8 +5608,6 @@ Supported local providers (presets):
                        help="Don't execute commands, just show what would happen")
     parser.add_argument("--no-confirm", action="store_true",
                        help="Don't ask for confirmations before each step")
-    parser.add_argument("--web-search", "-w", action="store_true",
-                       help="Search the web for up-to-date installation instructions")
     parser.add_argument("--example", action="store_true",
                        help="Run the ROCm installation example")
     parser.add_argument("--example-local", action="store_true",
@@ -3577,7 +5627,22 @@ Supported local providers (presets):
         return example_local_llm()
 
     # Build configuration based on provider
-    if args.provider == "local":
+    if args.provider == "builtin":
+        # Use AI Installer's own trained model - OFFLINE MODE!
+        config = AgentConfig(
+            llm_provider=LLMProvider.BUILTIN,
+            dry_run=args.dry_run,
+            verbose=True
+        )
+
+        print("=" * 60)
+        print("🧠 AI INSTALLER - OFFLINE MODE")
+        print("=" * 60)
+        print("Running with built-in AI Installer Agent model")
+        print("No API keys required!")
+        print("=" * 60)
+
+    elif args.provider == "local":
         # Build OpenAI-compatible config
         if args.base_url:
             # Custom URL provided
@@ -3620,8 +5685,7 @@ Supported local providers (presets):
             llm_provider=LLMProvider.OPENAI_COMPATIBLE,
             openai_compatible_config=local_config,
             dry_run=args.dry_run,
-            verbose=True,
-            web_search=args.web_search
+            verbose=True
         )
 
         # Handle test-connection mode
@@ -3655,16 +5719,14 @@ Supported local providers (presets):
             llm_provider=LLMProvider.OPENAI,
             model_name=args.model or "gpt-4o",
             dry_run=args.dry_run,
-            verbose=True,
-            web_search=args.web_search
+            verbose=True
         )
     elif args.provider == "gemini":
         config = AgentConfig(
             llm_provider=LLMProvider.GEMINI,
             model_name=args.model or "gemini-2.5-flash",
             dry_run=args.dry_run,
-            verbose=True,
-            web_search=args.web_search
+            verbose=True
         )
 
         # Handle list-models for Gemini
@@ -3689,8 +5751,7 @@ Supported local providers (presets):
             llm_provider=LLMProvider.ANTHROPIC,
             model_name=args.model or "claude-sonnet-4-20250514",
             dry_run=args.dry_run,
-            verbose=True,
-            web_search=args.web_search
+            verbose=True
         )
 
     # Require software argument for actual installation
@@ -3707,3 +5768,4 @@ Supported local providers (presets):
 
 if __name__ == "__main__":
     main()
+
