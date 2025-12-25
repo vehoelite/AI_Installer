@@ -63,7 +63,9 @@ try:
         AgentConfig, LLMProvider, OpenAICompatibleConfig,
         SystemAnalyzer, SystemInfo, InstallationReasoner,
         CommandExecutor, TestRunner, PlanEnhancer, WebSearcher,
-        AnthropicLLM, OpenAILLM, OpenAICompatibleLLM, GeminiLLM
+        AnthropicLLM, OpenAILLM, OpenAICompatibleLLM, GeminiLLM,
+        BuiltinLLM,  # AI Installer's own trained model
+        InstallerTools  # Native tools for package/Docker searches
     )
     CORE_AVAILABLE = True
 except ImportError as e:
@@ -390,8 +392,76 @@ class GeminiWorkerThread(QThread):
 
     def run(self):
         try:
+            # GeminiLLM is imported from ai_installer_cli which handles the import
             llm = GeminiLLM(self.api_key, self.model)
             models = llm.list_models()
+            self.finished_signal.emit({"success": True, "models": models})
+        except ImportError:
+            self.finished_signal.emit({
+                "success": False,
+                "error": "google-genai not installed. Run: pip install google-genai"
+            })
+        except Exception as e:
+            self.finished_signal.emit({"success": False, "error": str(e)})
+
+
+class OpenAIWorkerThread(QThread):
+    """Background worker thread for OpenAI API operations"""
+    finished_signal = Signal(dict)
+
+    def __init__(self, operation: str, api_key: str):
+        super().__init__()
+        self.operation = operation  # "test" or "fetch"
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            import openai
+        except ImportError:
+            self.finished_signal.emit({
+                "success": False,
+                "error": "openai package not installed. Run: pip install openai"
+            })
+            return
+
+        try:
+            client = openai.OpenAI(api_key=self.api_key)
+            # List models and filter for GPT models
+            all_models = client.models.list()
+            gpt_models = sorted([
+                m.id for m in all_models.data
+                if m.id.startswith(('gpt-4', 'gpt-3.5', 'o1', 'o3'))
+                and not m.id.endswith(('-instruct', '-vision'))
+            ], reverse=True)
+            self.finished_signal.emit({"success": True, "models": gpt_models})
+        except Exception as e:
+            self.finished_signal.emit({"success": False, "error": str(e)})
+
+
+class AnthropicWorkerThread(QThread):
+    """Background worker thread for Anthropic API operations"""
+    finished_signal = Signal(dict)
+
+    def __init__(self, operation: str, api_key: str):
+        super().__init__()
+        self.operation = operation  # "test" or "fetch"
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            from anthropic import Anthropic
+        except ImportError:
+            self.finished_signal.emit({
+                "success": False,
+                "error": "anthropic package not installed. Run: pip install anthropic"
+            })
+            return
+
+        try:
+            client = Anthropic(api_key=self.api_key)
+            # List available models
+            response = client.models.list()
+            models = [model.id for model in response.data]
             self.finished_signal.emit({"success": True, "models": models})
         except Exception as e:
             self.finished_signal.emit({"success": False, "error": str(e)})
@@ -537,7 +607,11 @@ class WorkerThread(QThread):
         if not config:
             raise ValueError("No configuration provided")
 
-        if config.llm.provider == "local":
+        if config.llm.provider == "builtin":
+            # Use AI Installer's own trained model - OFFLINE MODE!
+            # Model is loaded from ./models/ (static path)
+            return BuiltinLLM()
+        elif config.llm.provider == "local":
             base_url = get_config_manager().get_llm_base_url()
             local_config = OpenAICompatibleConfig(
                 base_url=base_url,
@@ -561,7 +635,6 @@ class WorkerThread(QThread):
         """Create installation plan using LLM"""
         software = self.kwargs.get("software", "")
         system_info = self.kwargs.get("system_info")
-        web_search = self.kwargs.get("web_search", False)
         gui_config = self.kwargs.get("gui_config")
 
         if not software:
@@ -582,13 +655,13 @@ class WorkerThread(QThread):
             system_info = analyzer.analyze()
             self.progress.emit(25)
 
-        # Web search for docs if enabled
+        # Web search for docs (automatic offline detection)
         web_docs = None
-        if web_search:
+        searcher = WebSearcher(verbose=False)
+        if searcher.is_online():
             self.output.emit("Searching web for up-to-date installation docs...")
             self.progress.emit(35)
             try:
-                searcher = WebSearcher(verbose=False)
                 os_info = f"{system_info.distro_name} {system_info.distro_version}"
                 web_docs = searcher.search_installation_docs(software, os_info)
                 if web_docs and web_docs.get("fetched_docs"):
@@ -601,7 +674,8 @@ class WorkerThread(QThread):
         self.output.emit("Consulting AI for installation plan...")
         try:
             llm = self._get_llm()
-            reasoner = InstallationReasoner(llm)
+            tools = InstallerTools()
+            reasoner = InstallationReasoner(llm, tools=tools)
             self.progress.emit(55)
 
             plan = reasoner.analyze_requirements(system_info, software, web_docs)
@@ -1344,7 +1418,8 @@ class WorkerThread(QThread):
         """Attempt immediate repair of a failed command before continuing"""
         try:
             llm = self._get_llm()
-            reasoner = InstallationReasoner(llm)
+            tools = InstallerTools()
+            reasoner = InstallationReasoner(llm, tools=tools)
 
             error_msg = result.stderr or result.stdout or "Unknown error"
 
@@ -1635,7 +1710,8 @@ class WorkerThread(QThread):
         """Attempt to auto-repair failed installation steps"""
         try:
             llm = self._get_llm()
-            reasoner = InstallationReasoner(llm)
+            tools = InstallerTools()
+            reasoner = InstallationReasoner(llm, tools=tools)
 
             for failure in failed_steps[:3]:  # Limit to first 3 failures
                 self.output.emit(f"\n[*] Analyzing failure in step {failure['step']}...")
@@ -1712,7 +1788,8 @@ class WorkerThread(QThread):
 
         try:
             llm = self._get_llm()
-            reasoner = InstallationReasoner(llm)
+            tools = InstallerTools()
+            reasoner = InstallationReasoner(llm, tools=tools)
             answer = reasoner.answer_question(question, plan or {}, system_info, web_docs)
             self.finished_signal.emit({"answer": answer})
         except Exception as e:
@@ -1737,7 +1814,8 @@ class WorkerThread(QThread):
 
         try:
             llm = self._get_llm()
-            reasoner = InstallationReasoner(llm)
+            tools = InstallerTools()
+            reasoner = InstallationReasoner(llm, tools=tools)
             modified_plan = reasoner.modify_plan(plan, request, system_info)
             self.progress.emit(70)
 
@@ -2014,7 +2092,13 @@ class SetupWizard(QDialog):
         provider_layout = QFormLayout(provider_group)
 
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["Local LLM (LM Studio, Ollama, etc.)", "OpenAI API", "Anthropic API", "Google Gemini API"])
+        self.provider_combo.addItems([
+            "🧠 Built-in Model (Offline, No API Key!)",
+            "Local LLM (LM Studio, Ollama, etc.)",
+            "OpenAI API",
+            "Anthropic API",
+            "Google Gemini API"
+        ])
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         provider_layout.addRow("Provider:", self.provider_combo)
 
@@ -2023,7 +2107,32 @@ class SetupWizard(QDialog):
         # Stacked widget for provider-specific settings
         self.settings_stack = QStackedWidget()
 
-        # Local LLM settings
+        # Built-in Model settings (index 0)
+        builtin_widget = QWidget()
+        builtin_layout = QFormLayout(builtin_widget)
+
+        builtin_info = QLabel(
+            "🧠 <b>AI Installer's Own Trained Model</b><br><br>"
+            "This model was trained specifically for software installation tasks. "
+            "It runs completely offline with no API keys required!<br><br>"
+            "<span style='color: #a6e3a1;'>✓ No internet connection needed</span><br>"
+            "<span style='color: #a6e3a1;'>✓ No API costs</span><br>"
+            "<span style='color: #a6e3a1;'>✓ Optimized for installation tasks</span>"
+        )
+        builtin_info.setWordWrap(True)
+        builtin_info.setTextFormat(Qt.RichText)
+        builtin_layout.addRow(builtin_info)
+
+        builtin_model_location = QLabel(
+            "<small>Model location: <b>./models/</b></small>"
+        )
+        builtin_model_location.setTextFormat(Qt.RichText)
+        builtin_model_location.setStyleSheet("color: #6c7086;")
+        builtin_layout.addRow(builtin_model_location)
+
+        self.settings_stack.addWidget(builtin_widget)
+
+        # Local LLM settings (index 1)
         local_widget = QWidget()
         local_layout = QFormLayout(local_widget)
 
@@ -2063,10 +2172,30 @@ class SetupWizard(QDialog):
         self.openai_key.setEchoMode(QLineEdit.Password)
         openai_layout.addRow("API Key:", self.openai_key)
 
+        openai_key_link = QLabel('<a href="https://platform.openai.com/api-keys">Get API Key from OpenAI</a>')
+        openai_key_link.setOpenExternalLinks(True)
+        openai_layout.addRow("", openai_key_link)
+
         self.openai_model = QComboBox()
+        self.openai_model.setMinimumWidth(300)
         self.openai_model.addItems(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"])
         self.openai_model.setEditable(False)  # Dropdown only - prevents typos
         openai_layout.addRow("Model:", self.openai_model)
+
+        # Test connection and fetch models buttons
+        openai_btn_layout = QHBoxLayout()
+        self.openai_test_btn = QPushButton("Test Connection")
+        self.openai_test_btn.setObjectName("primary")
+        self.openai_test_btn.clicked.connect(self._test_openai_connection)
+        openai_btn_layout.addWidget(self.openai_test_btn)
+
+        self.openai_fetch_btn = QPushButton("Fetch Models")
+        self.openai_fetch_btn.clicked.connect(self._fetch_openai_models)
+        openai_btn_layout.addWidget(self.openai_fetch_btn)
+        openai_layout.addRow("", openai_btn_layout)
+
+        self.openai_status = QLabel("")
+        openai_layout.addRow("", self.openai_status)
 
         self.settings_stack.addWidget(openai_widget)
 
@@ -2079,7 +2208,12 @@ class SetupWizard(QDialog):
         self.anthropic_key.setEchoMode(QLineEdit.Password)
         anthropic_layout.addRow("API Key:", self.anthropic_key)
 
+        anthropic_key_link = QLabel('<a href="https://console.anthropic.com/settings/keys">Get API Key from Anthropic</a>')
+        anthropic_key_link.setOpenExternalLinks(True)
+        anthropic_layout.addRow("", anthropic_key_link)
+
         self.anthropic_model = QComboBox()
+        self.anthropic_model.setMinimumWidth(300)
         self.anthropic_model.addItems([
             "claude-sonnet-4-20250514",
             "claude-3-5-sonnet-20241022",
@@ -2089,6 +2223,17 @@ class SetupWizard(QDialog):
         ])
         self.anthropic_model.setEditable(False)  # Dropdown only - prevents typos
         anthropic_layout.addRow("Model:", self.anthropic_model)
+
+        # Test connection button (Anthropic has no list models API)
+        anthropic_btn_layout = QHBoxLayout()
+        self.anthropic_test_btn = QPushButton("Test Connection")
+        self.anthropic_test_btn.setObjectName("primary")
+        self.anthropic_test_btn.clicked.connect(self._test_anthropic_connection)
+        anthropic_btn_layout.addWidget(self.anthropic_test_btn)
+        anthropic_layout.addRow("", anthropic_btn_layout)
+
+        self.anthropic_status = QLabel("")
+        anthropic_layout.addRow("", self.anthropic_status)
 
         self.settings_stack.addWidget(anthropic_widget)
 
@@ -2146,10 +2291,6 @@ class SetupWizard(QDialog):
         options_group = QGroupBox("Options")
         options_layout = QVBoxLayout(options_group)
 
-        self.web_search_check = QCheckBox("Enable web search for up-to-date installation docs")
-        self.web_search_check.setChecked(True)
-        options_layout.addWidget(self.web_search_check)
-
         self.verbose_check = QCheckBox("Show detailed output during installation")
         self.verbose_check.setChecked(True)
         options_layout.addWidget(self.verbose_check)
@@ -2193,8 +2334,10 @@ class SetupWizard(QDialog):
         llm = self.config.llm
 
         # Set provider
-        provider_map = {"local": 0, "openai": 1, "anthropic": 2, "gemini": 3}
+        provider_map = {"builtin": 0, "local": 1, "openai": 2, "anthropic": 3, "gemini": 4}
         self.provider_combo.setCurrentIndex(provider_map.get(llm.provider, 0))
+
+        # Built-in model uses static path - no config to load
 
         # Local settings
         preset_map = {"lm-studio": 0, "ollama": 1, "localai": 2, "custom": 3}
@@ -2217,7 +2360,6 @@ class SetupWizard(QDialog):
             self.gemini_model.setCurrentText(llm.gemini_model)
 
         # Options
-        self.web_search_check.setChecked(self.config.app.web_search_enabled)
         self.verbose_check.setChecked(self.config.app.verbose_output)
         self.confirm_check.setChecked(self.config.app.confirm_before_execute)
         self.confirm_each_step_check.setChecked(self.config.app.confirm_each_step)
@@ -2260,6 +2402,111 @@ class SetupWizard(QDialog):
     def _on_test_error(self, error):
         self.test_status.setText(f"✗ Error: {error[:50]}...")
         self.test_status.setStyleSheet("color: #f38ba8;")
+
+    def _test_openai_connection(self):
+        """Test OpenAI API connection"""
+        api_key = self.openai_key.text().strip()
+        if not api_key:
+            self.openai_status.setText("✗ Please enter an API key first")
+            self.openai_status.setStyleSheet("color: #f38ba8;")
+            return
+
+        self.openai_status.setText("Testing connection...")
+        self.openai_status.setStyleSheet("color: #f9e2af;")
+        self.openai_test_btn.setEnabled(False)
+        self.openai_fetch_btn.setEnabled(False)
+
+        self._openai_worker = OpenAIWorkerThread("test", api_key)
+        self._openai_worker.finished_signal.connect(self._on_openai_test_complete)
+        self._openai_worker.start()
+
+    def _on_openai_test_complete(self, result):
+        """Handle OpenAI test result"""
+        self.openai_test_btn.setEnabled(True)
+        self.openai_fetch_btn.setEnabled(True)
+
+        if result.get("success"):
+            models = result.get("models", [])
+            model_count = len(models) if models else 0
+            self.openai_status.setText(f"✓ Connected! {model_count} models available")
+            self.openai_status.setStyleSheet("color: #a6e3a1;")
+        else:
+            error = result.get("error", "Connection failed")[:60]
+            self.openai_status.setText(f"✗ {error}")
+            self.openai_status.setStyleSheet("color: #f38ba8;")
+
+    def _fetch_openai_models(self):
+        """Fetch available OpenAI models and populate dropdown"""
+        api_key = self.openai_key.text().strip()
+        if not api_key:
+            self.openai_status.setText("✗ Please enter an API key first")
+            self.openai_status.setStyleSheet("color: #f38ba8;")
+            return
+
+        self.openai_status.setText("Fetching models...")
+        self.openai_status.setStyleSheet("color: #f9e2af;")
+        self.openai_test_btn.setEnabled(False)
+        self.openai_fetch_btn.setEnabled(False)
+
+        self._openai_worker = OpenAIWorkerThread("fetch", api_key)
+        self._openai_worker.finished_signal.connect(self._on_openai_fetch_complete)
+        self._openai_worker.start()
+
+    def _on_openai_fetch_complete(self, result):
+        """Handle OpenAI model fetch result"""
+        self.openai_test_btn.setEnabled(True)
+        self.openai_fetch_btn.setEnabled(True)
+
+        if result.get("success"):
+            models = result.get("models", [])
+            if models:
+                current = self.openai_model.currentText()
+                self.openai_model.clear()
+                self.openai_model.addItems(models)
+
+                index = self.openai_model.findText(current)
+                if index >= 0:
+                    self.openai_model.setCurrentIndex(index)
+                else:
+                    self.openai_model.setCurrentIndex(0)
+
+                self.openai_status.setText(f"✓ Loaded {len(models)} GPT models")
+                self.openai_status.setStyleSheet("color: #a6e3a1;")
+            else:
+                self.openai_status.setText("✗ No GPT models found")
+                self.openai_status.setStyleSheet("color: #f38ba8;")
+        else:
+            error = result.get("error", "Fetch failed")[:60]
+            self.openai_status.setText(f"✗ {error}")
+            self.openai_status.setStyleSheet("color: #f38ba8;")
+
+    def _test_anthropic_connection(self):
+        """Test Anthropic API connection"""
+        api_key = self.anthropic_key.text().strip()
+        if not api_key:
+            self.anthropic_status.setText("✗ Please enter an API key first")
+            self.anthropic_status.setStyleSheet("color: #f38ba8;")
+            return
+
+        self.anthropic_status.setText("Testing connection...")
+        self.anthropic_status.setStyleSheet("color: #f9e2af;")
+        self.anthropic_test_btn.setEnabled(False)
+
+        self._anthropic_worker = AnthropicWorkerThread("test", api_key)
+        self._anthropic_worker.finished_signal.connect(self._on_anthropic_test_complete)
+        self._anthropic_worker.start()
+
+    def _on_anthropic_test_complete(self, result):
+        """Handle Anthropic test result"""
+        self.anthropic_test_btn.setEnabled(True)
+
+        if result.get("success"):
+            self.anthropic_status.setText("✓ Connected! API key is valid")
+            self.anthropic_status.setStyleSheet("color: #a6e3a1;")
+        else:
+            error = result.get("error", "Connection failed")[:60]
+            self.anthropic_status.setText(f"✗ {error}")
+            self.anthropic_status.setStyleSheet("color: #f38ba8;")
 
     def _test_gemini_connection(self):
         """Test Gemini API connection"""
@@ -2346,8 +2593,10 @@ class SetupWizard(QDialog):
 
     def _save_to_config(self):
         """Save UI values to config object"""
-        providers = ["local", "openai", "anthropic", "gemini"]
+        providers = ["builtin", "local", "openai", "anthropic", "gemini"]
         self.config.llm.provider = providers[self.provider_combo.currentIndex()]
+
+        # Built-in model uses static path (./models/) - no config needed
 
         presets = ["lm-studio", "ollama", "localai", "custom"]
         self.config.llm.local_preset = presets[self.local_preset.currentIndex()]
@@ -2364,7 +2613,6 @@ class SetupWizard(QDialog):
         self.config.llm.gemini_api_key = self.gemini_key.text()
         self.config.llm.gemini_model = self.gemini_model.currentText()
 
-        self.config.app.web_search_enabled = self.web_search_check.isChecked()
         self.config.app.verbose_output = self.verbose_check.isChecked()
         self.config.app.confirm_before_execute = self.confirm_check.isChecked()
         self.config.app.confirm_each_step = self.confirm_each_step_check.isChecked()
@@ -2444,11 +2692,6 @@ class MainWindow(QMainWindow):
 
         # Options row
         options_layout = QHBoxLayout()
-
-        self.web_search_check = QCheckBox("Web Search")
-        self.web_search_check.setChecked(self.config.app.web_search_enabled)
-        self.web_search_check.setToolTip("Search the web for up-to-date installation instructions")
-        options_layout.addWidget(self.web_search_check)
 
         self.dry_run_check = QCheckBox("Dry Run")
         self.dry_run_check.setToolTip("Preview commands without executing them")
@@ -2686,12 +2929,17 @@ class MainWindow(QMainWindow):
             if info.rocm_version:
                 driver_text += f" ROCm {info.rocm_version}"
 
+            # Add internet speed if it was measured
+            internet_text = ""
+            if info.measured_internet_speed_mbps:
+                internet_text = f"<br><b>Internet Speed:</b> {info.measured_internet_speed_mbps:.1f} Mbps"
+
             text = f"""<b>OS:</b> {info.distro_name} {info.distro_version}<br>
 <b>Kernel:</b> {info.kernel_version}<br>
 <b>WSL:</b> {wsl_text}<br>
 <b>GPU:</b> {gpu_text}{driver_text}<br>
 <b>Memory:</b> {info.memory_info.get('total', 'Unknown')}<br>
-<b>Disk:</b> {info.disk_space.get('available', 'Unknown')} available"""
+<b>Disk:</b> {info.disk_space.get('available', 'Unknown')} available{internet_text}"""
             self.system_label.setText(text)
         self.status_bar.showMessage("Ready")
 
@@ -2717,7 +2965,6 @@ class MainWindow(QMainWindow):
             "create_plan",
             software=software_with_compose,
             system_info=self.system_info,
-            web_search=self.web_search_check.isChecked(),
             gui_config=self.config,
             custom_compose_content=self.custom_compose_content
         )
@@ -2744,11 +2991,23 @@ class MainWindow(QMainWindow):
 
         if self.current_plan:
             self._display_plan()
+            
+            # Check if Agent is asking about removal of existing installation
+            if self.current_plan.get("ask_about_removal"):
+                software_name = self.current_plan.get("software_name", "the requested software")
+                self._append_output(f"\n[?] EXISTING INSTALLATION DETECTED")
+                self._append_output(f"The software '{software_name}' is already installed on your system.")
+                self._append_output(f"\nWould you like me to remove the previous installation before installing again?")
+                self._append_output(f"\nAnswer using one of:")
+                self._append_output(f'  • "Can you remove the previous installation" (remove then reinstall)')
+                self._append_output(f'  • "Continue" (keep existing and skip reinstall)')
+            
             self.chat_input.setEnabled(True)
             self.send_btn.setEnabled(True)
             self.install_btn.setEnabled(True)
             self._append_output("\n[OK] Plan created successfully!")
             self._append_output("You can now ask questions, request changes, or click 'Install Now'")
+
 
     def _on_plan_error(self, error):
         """Handle plan creation error"""
@@ -2778,20 +3037,28 @@ class MainWindow(QMainWindow):
 
         # Configuration
         config = plan.get("configuration", {})
+        # Handle case where config might be a list instead of dict (from older or misconfigured LLMs)
+        if isinstance(config, list):
+            config = {}  # Convert to empty dict for safe access
+        
         if config:
             lines.append("\n[CONFIG] Configuration:")
-            if config.get("ports"):
-                lines.append(f"  Ports: {', '.join(map(str, config['ports']))}")
-            if config.get("data_directory"):
-                lines.append(f"  Data: {config['data_directory']}")
-
+            if isinstance(config, dict):
+                if config.get("ports"):
+                    lines.append(f"  Ports: {', '.join(map(str, config['ports']))}")
+                if config.get("data_directory"):
+                    lines.append(f"  Data: {config['data_directory']}")
+        
         # Port conflict detection - check config ports against system ports in use
         ports_in_use = getattr(self.system_info, 'ports_in_use', []) if self.system_info else []
-        planned_ports = config.get("ports", []) if config else []
+        planned_ports = config.get("ports", []) if isinstance(config, dict) else []
+
 
         # Also extract ports from warnings (e.g., "binds to ports 80, 8080, and 8443")
         for warning in plan.get("warnings", []):
-            port_matches = re.findall(r'\b(\d{2,5})\b', warning)
+            # Handle both string and dict warning formats
+            warning_text = warning if isinstance(warning, str) else str(warning.get("message", "") if isinstance(warning, dict) else warning)
+            port_matches = re.findall(r'\b(\d{2,5})\b', warning_text)
             for match in port_matches:
                 try:
                     port = int(match)
@@ -2816,19 +3083,34 @@ class MainWindow(QMainWindow):
         if metrics:
             lines.append("\n[RESOURCES] Requirements:")
             total_download = metrics.total_download_size_mb + metrics.docker_download_size_mb
-            if total_download > 0:
+            # Only show if >= 0.05 (displays as at least 0.1 MB)
+            if total_download >= 0.05:
                 lines.append(f"  Download: {total_download:.1f} MB")
-            if metrics.total_disk_space_mb > 0:
+            elif total_download > 0:
+                lines.append(f"  Download: <0.1 MB")
+            elif metrics.packages_already_installed and not metrics.packages_to_install:
+                lines.append(f"  Download: 0 MB (packages already installed)")
+            if metrics.total_disk_space_mb >= 0.05:
                 lines.append(f"  Disk space: {metrics.total_disk_space_mb:.1f} MB")
+            elif metrics.total_disk_space_mb > 0:
+                lines.append(f"  Disk space: <0.1 MB")
+            elif metrics.packages_already_installed and not metrics.packages_to_install:
+                lines.append(f"  Disk space: 0 MB (packages already installed)")
             lines.append(f"  Est. time: ~{metrics.estimated_total_time_minutes:.1f} min")
 
         # Packages to install
         if metrics and metrics.packages_to_install:
-            lines.append(f"\n[PACKAGES] ({len(metrics.packages_to_install)}):")
+            lines.append(f"\n[PACKAGES] To Install ({len(metrics.packages_to_install)}):")
             for pkg in metrics.packages_to_install[:5]:
                 lines.append(f"  - {pkg}")
             if len(metrics.packages_to_install) > 5:
                 lines.append(f"  ... and {len(metrics.packages_to_install) - 5} more")
+        elif metrics and metrics.packages_already_installed:
+            lines.append(f"\n[PACKAGES] Already Installed ({len(metrics.packages_already_installed)}):")
+            for pkg in metrics.packages_already_installed[:3]:
+                lines.append(f"  - {pkg} (installed)")
+            if len(metrics.packages_already_installed) > 3:
+                lines.append(f"  ... and {len(metrics.packages_already_installed) - 3} more")
 
         # Docker images
         if metrics and metrics.docker_images_to_pull:
@@ -2855,8 +3137,10 @@ class MainWindow(QMainWindow):
         if plan.get("warnings"):
             filtered_warnings = []
             for warning in plan["warnings"]:
+                # Handle both string and dict warning formats
+                warning_text = warning if isinstance(warning, str) else str(warning.get("message", "") if isinstance(warning, dict) else warning)
                 # Skip generic port warnings - we handle ports intelligently above
-                if any(phrase in warning.lower() for phrase in [
+                if any(phrase in warning_text.lower() for phrase in [
                     "ensure these ports are not in use",
                     "ports are not in use",
                     "ports are available",
@@ -2864,7 +3148,7 @@ class MainWindow(QMainWindow):
                     "make sure port"
                 ]):
                     continue
-                filtered_warnings.append(warning)
+                filtered_warnings.append(warning_text)
 
             if filtered_warnings:
                 lines.append("\n[!] Warnings:")
@@ -2887,6 +3171,27 @@ class MainWindow(QMainWindow):
 
         self._append_output(f"\n[YOU] {message}")
         self.chat_input.clear()
+
+        # Check if this is a response to "ask_about_removal" prompt
+        if self.current_plan and self.current_plan.get("ask_about_removal"):
+            message_lower = message.lower()
+            
+            # User wants to remove the old installation
+            if "remove" in message_lower and "previous" in message_lower:
+                self._append_output("[SYSTEM] Understood. I will add a removal step before reinstalling.")
+                # Modify the plan to include removal steps
+                self._handle_removal_request()
+                return
+            
+            # User wants to continue without removal
+            elif message_lower == "continue":
+                self._append_output("[SYSTEM] Understood. Skipping reinstall and keeping existing installation.")
+                # Clear the removal flag so plan proceeds as-is
+                self.current_plan["ask_about_removal"] = False
+                self.chat_input.setEnabled(True)
+                self.send_btn.setEnabled(True)
+                self.install_btn.setEnabled(True)
+                return
 
         # Detect if this is a question or modification request
         is_question = self._is_question(message)
@@ -2920,6 +3225,134 @@ class MainWindow(QMainWindow):
         self.worker.output.connect(self._append_output)
         self.worker.error.connect(self._on_chat_error)
         self.worker.start()
+
+    def _handle_removal_request(self):
+        """Handle user request to remove existing installation before reinstalling"""
+        # Modify the plan to add removal steps at the beginning
+        if not self.current_plan:
+            return
+
+        software_name = self.current_plan.get("software_name", "the software")
+        existing_steps = self.current_plan.get("installation_steps", [])
+
+        # Detect package type from software name and existing commands
+        package_type = self._detect_package_type(software_name, existing_steps)
+
+        # Generate appropriate removal command based on package type
+        removal_cmd, requires_sudo = self._generate_removal_command(software_name, package_type)
+
+        # Create proper step dictionary (matching the expected format)
+        removal_step = {
+            "step": 1,
+            "description": f"Remove existing {software_name} installation",
+            "commands": [removal_cmd],
+            "requires_sudo": requires_sudo,
+            "risk_level": "medium"
+        }
+
+        # Renumber existing steps (increment step numbers by 1)
+        for step in existing_steps:
+            if isinstance(step, dict) and "step" in step:
+                step["step"] = step["step"] + 1
+
+        # Prepend removal step
+        self.current_plan["installation_steps"] = [removal_step] + existing_steps
+
+        # Add warning about removal
+        warnings = self.current_plan.get("warnings", [])
+        if not isinstance(warnings, list):
+            warnings = []
+        warnings.insert(0, f"WARNING: This plan includes removal of existing {software_name} before reinstallation.")
+        self.current_plan["warnings"] = warnings
+
+        # Clear the removal flag
+        self.current_plan["ask_about_removal"] = False
+
+        # Refresh the display
+        self._display_plan()
+        self._append_output(f"\n[OK] Plan updated to include removal of existing {software_name}")
+        self._append_output("You can now review the updated plan or click 'Install Now'")
+
+        self.chat_input.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.install_btn.setEnabled(True)
+
+    def _detect_package_type(self, software_name: str, steps: list) -> str:
+        """Detect the package type (snap, apt, docker, npm, pip, etc.) from software name and commands"""
+        software_lower = software_name.lower()
+
+        # Check software name first
+        if "snap" in software_lower:
+            return "snap"
+        if "docker" in software_lower or "container" in software_lower:
+            return "docker"
+        if "flatpak" in software_lower:
+            return "flatpak"
+
+        # Check commands in existing steps
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            commands = step.get("commands", [])
+            for cmd in commands:
+                if not isinstance(cmd, str):
+                    continue
+                cmd_lower = cmd.lower()
+                if "snap install" in cmd_lower or "snap " in cmd_lower:
+                    return "snap"
+                if "docker run" in cmd_lower or "docker-compose" in cmd_lower or "docker compose" in cmd_lower:
+                    return "docker"
+                if "apt install" in cmd_lower or "apt-get install" in cmd_lower:
+                    return "apt"
+                if "npm install" in cmd_lower:
+                    return "npm"
+                if "pip install" in cmd_lower or "pip3 install" in cmd_lower:
+                    return "pip"
+                if "flatpak install" in cmd_lower:
+                    return "flatpak"
+                if "cargo install" in cmd_lower:
+                    return "cargo"
+
+        # Default to apt for system packages
+        return "apt"
+
+    def _generate_removal_command(self, software_name: str, package_type: str) -> tuple:
+        """Generate appropriate removal command based on package type. Returns (command, requires_sudo)"""
+        # Extract package name from software name (remove common suffixes/prefixes)
+        pkg_name = software_name.lower()
+        for suffix in [" snap", " flatpak", " container", " docker", " (snap)", " (flatpak)"]:
+            pkg_name = pkg_name.replace(suffix, "")
+        pkg_name = pkg_name.strip()
+
+        # Handle common software name to package name mappings
+        pkg_mappings = {
+            "visual studio code": "code",
+            "vscode": "code",
+            "vs code": "code",
+            "firefox": "firefox",
+            "chromium": "chromium",
+            "node.js": "nodejs",
+            "python": "python3",
+        }
+        pkg_name = pkg_mappings.get(pkg_name, pkg_name)
+
+        if package_type == "snap":
+            return f"snap remove {pkg_name}", True
+        elif package_type == "docker":
+            # For Docker, stop and remove container
+            container_name = pkg_name.replace(" ", "_").replace("-", "_")
+            return f"docker stop {container_name} 2>/dev/null; docker rm {container_name} 2>/dev/null || echo 'Container not found or already removed'", False
+        elif package_type == "flatpak":
+            return f"flatpak uninstall -y {pkg_name}", False
+        elif package_type == "npm":
+            return f"npm uninstall -g {pkg_name}", False
+        elif package_type == "pip":
+            return f"pip3 uninstall -y {pkg_name}", False
+        elif package_type == "cargo":
+            return f"cargo uninstall {pkg_name}", False
+        else:  # apt (default)
+            return f"apt remove -y {pkg_name}", True
+
 
     def _is_question(self, text: str) -> bool:
         """Detect if user input is a question vs modification request"""
@@ -3143,7 +3576,6 @@ class MainWindow(QMainWindow):
         if wizard.exec() == QDialog.Accepted:
             # Reload config
             self.config = self.config_manager.config
-            self.web_search_check.setChecked(self.config.app.web_search_enabled)
             self.status_bar.showMessage("Settings saved!")
 
     def _show_about(self):
