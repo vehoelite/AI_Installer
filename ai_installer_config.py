@@ -16,7 +16,9 @@ from pathlib import Path
 @dataclass
 class LLMProviderSettings:
     """Settings for LLM provider configuration"""
-    provider: str = "local"  # "local", "openai", "anthropic", "gemini"
+    provider: str = "builtin"  # "builtin", "local", "openai", "anthropic", "gemini"
+
+    # Built-in model uses static path ./models/ (no configuration needed)
 
     # Local LLM settings
     local_preset: str = "lm-studio"  # "lm-studio", "ollama", "localai", "custom"
@@ -56,7 +58,7 @@ class AppSettings:
 
     # Window settings
     window_width: int = 1200
-    window_height: int = 1200
+    window_height: int = 800
     window_x: int = -1  # -1 means center
     window_y: int = -1
 
@@ -66,7 +68,7 @@ class Config:
     """Main configuration container"""
     llm: LLMProviderSettings = field(default_factory=LLMProviderSettings)
     app: AppSettings = field(default_factory=AppSettings)
-    version: str = "1.2"
+    version: str = "1.0.0"
 
     def to_dict(self) -> dict:
         return {
