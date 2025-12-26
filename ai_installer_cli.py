@@ -2048,7 +2048,8 @@ Just the raw JSON starting with { and ending with }
         1. Pure JSON: {"key": "value"}
         2. Markdown code blocks: ```json\n{...}\n```
         3. Mixed text with JSON embedded
-        4. Pure prose (fallback to prose_to_json conversion)
+        4. Incomplete JSON (model stopped generating)
+        5. Pure prose (fallback to prose_to_json conversion)
         """
         import re
 
@@ -2066,6 +2067,9 @@ Just the raw JSON starting with { and ending with }
         # Look for the outermost { ... } pair
         brace_count = 0
         start_idx = -1
+        best_json = None
+        best_length = 0
+        
         for i, char in enumerate(response):
             if char == '{':
                 if brace_count == 0:
@@ -2076,16 +2080,71 @@ Just the raw JSON starting with { and ending with }
                 if brace_count == 0 and start_idx != -1:
                     potential_json = response[start_idx:i+1]
                     try:
-                        json.loads(potential_json)
-                        return potential_json
+                        # Validate it's actually valid JSON
+                        parsed = json.loads(potential_json)
+                        # Keep the longest valid JSON we find
+                        if len(potential_json) > best_length:
+                            best_json = potential_json
+                            best_length = len(potential_json)
                     except json.JSONDecodeError:
                         # Continue looking for valid JSON
-                        start_idx = -1
+                        pass
+                    start_idx = -1
+        
+        # If we found valid JSON, return it
+        if best_json:
+            return best_json
+        
+        # If we found a JSON start but it's incomplete, try to repair it
+        if start_idx != -1 and brace_count > 0:
+            # We have an incomplete JSON - try to close it
+            incomplete_json = response[start_idx:]
+            repaired = self._repair_incomplete_json(incomplete_json)
+            try:
+                json.loads(repaired)
+                print("  ✅ Repaired incomplete JSON in _extract_json")
+                return repaired
+            except json.JSONDecodeError:
+                # Still invalid, fall through to prose converter
+                pass
 
         # No valid JSON found - try to convert prose to JSON
         print("  ⚠️  DEBUG: Model output prose instead of JSON, using fallback converter")
         print(f"      First 100 chars: {response[:100]}...")
+        print(f"      Response length: {len(response)} chars")
+        print(f"      Has opening brace: {'{' in response}")
+        print(f"      Has closing brace: {'}' in response}")
+        if '{' in response:
+            brace_balance = response.count('{') - response.count('}')
+            print(f"      Brace balance: {brace_balance} (positive = unclosed)")
         return self._prose_to_json(response)
+    
+    def _repair_incomplete_json(self, incomplete: str) -> str:
+        """
+        Attempt to repair incomplete JSON by closing open structures.
+        
+        This handles cases where the model stopped generating mid-JSON.
+        """
+        repaired = incomplete.rstrip()
+        
+        # Count unclosed structures
+        open_braces = repaired.count('{') - repaired.count('}')
+        open_brackets = repaired.count('[') - repaired.count(']')
+        
+        # Remove trailing commas before closing
+        repaired = re.sub(r',\s*$', '', repaired)
+        
+        # Close strings if we're in the middle of one
+        if repaired and not repaired.rstrip().endswith(('"', "'", '}', ']')):
+            # Check if we're in a string (odd number of unescaped quotes)
+            quote_count = len(re.findall(r'(?<!\\)"', repaired))
+            if quote_count % 2 == 1:
+                repaired += '"'
+        
+        # Close arrays and objects
+        repaired += ']' * open_brackets + '}' * open_braces
+        
+        return repaired
 
     def _prose_to_json(self, prose: str) -> str:
         """
@@ -2287,7 +2346,28 @@ Just the raw JSON starting with { and ending with }
         # For JSON, we need to prepend the '{' we started with
         if expects_json:
             response = "{" + response
-            response = self._extract_json(response)
+            extracted_json = self._extract_json(response)
+            
+            # Validate the extracted JSON is actually parseable
+            try:
+                json.loads(extracted_json)
+                return extracted_json
+            except json.JSONDecodeError as e:
+                # JSON is invalid - try to repair it one more time
+                print(f"  ⚠️  DEBUG: Extracted JSON is invalid, attempting final repair...")
+                print(f"      Error: {str(e)[:100]}")
+                print(f"      Extracted JSON (first 200 chars): {extracted_json[:200]}...")
+                
+                # Try repair
+                repaired = self._repair_incomplete_json(extracted_json)
+                try:
+                    json.loads(repaired)
+                    print(f"  ✅ Repaired JSON successfully in query()")
+                    return repaired
+                except json.JSONDecodeError:
+                    # Still invalid - return as-is and let _parse_json_response handle it
+                    print(f"  ⚠️  Could not repair JSON, returning as-is for _parse_json_response to handle")
+                    return extracted_json
 
         return response
 
@@ -3681,9 +3761,46 @@ Respond with a JSON object:
             if result:
                 return result
 
+        # Strategy 5: Try to find incomplete JSON and repair it aggressively
+        # This handles cases where the model stopped generating mid-JSON
+        if '{' in response:
+            # Find the first { and try to extract/repair from there
+            first_brace = response.find('{')
+            if first_brace != -1:
+                # Extract everything from first brace to end
+                potential_incomplete = response[first_brace:]
+                
+                # Count braces to see if it's incomplete
+                open_braces = potential_incomplete.count('{') - potential_incomplete.count('}')
+                open_brackets = potential_incomplete.count('[') - potential_incomplete.count(']')
+                
+                if open_braces > 0 or open_brackets > 0:
+                    # Try aggressive repair: close all open structures
+                    repaired = potential_incomplete.rstrip()
+                    # Remove trailing commas
+                    repaired = re.sub(r',\s*$', '', repaired)
+                    # Close unclosed strings
+                    quote_count = len(re.findall(r'(?<!\\)"', repaired))
+                    if quote_count % 2 == 1:
+                        repaired += '"'
+                    # Close arrays and objects
+                    repaired += ']' * open_brackets + '}' * open_braces
+                    
+                    result = try_parse(repaired)
+                    if result:
+                        print("  ✅ Repaired incomplete JSON successfully in _parse_json_response")
+                        return result
+
         # All strategies failed - return a safe default with error info
         print("  ⚠️  Warning: Could not parse LLM response as JSON, using fallback")
-        print(f"  📝 Raw response (first 300 chars): {response[:300]}...")
+        print(f"  📝 Raw response (first 500 chars): {response[:500]}...")
+        if len(response) > 500:
+            print(f"  📝 Raw response (last 200 chars): ...{response[-200:]}")
+        
+        # Diagnostic info
+        brace_balance = response.count('{') - response.count('}')
+        bracket_balance = response.count('[') - response.count(']')
+        print(f"  📊 Diagnostics: brace_balance={brace_balance}, bracket_balance={bracket_balance}, length={len(response)}")
 
         # Return a minimal valid response so the caller can continue
         return {
@@ -5768,4 +5885,5 @@ Providers:
 
 if __name__ == "__main__":
     main()
+
 
