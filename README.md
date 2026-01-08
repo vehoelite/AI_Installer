@@ -160,18 +160,23 @@ python ai_installer_cli.py --provider local --local-preset ollama --list-models
 
 # Prerequisites for CLI
 ```sh
+git clone https://github.com/vehoelite/AI_Installer.git
+wget https://github.com/vehoelite/AI_Installer/releases/download/2.0/ai_installer-q4_k_m.gguf -P AI_Installer/models
+cd AI_Installer
 python3 -m venv venv
 source venv/bin/activate
-git clone https://github.com/vehoelite/AI_Installer.git
-wget 
 pip install anthropic  # or openai
 export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY or GEMINI_API_KEY
 # if using gguf
-
+pip install llama-cpp-python
+python ai_installer_cli.py "What your installing goes here"
 ```
 
 # Prerequisites for GUI
 ```sh
+git clone https://github.com/vehoelite/AI_Installer.git
+wget https://github.com/vehoelite/AI_Installer/releases/download/2.0/ai_installer-q4_k_m.gguf -P AI_Installer/models
+cd AI_Installer
 python3 -m venv venv
 source venv/bin/activate
 # using claude/anthropic
