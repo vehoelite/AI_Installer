@@ -162,8 +162,12 @@ python ai_installer_cli.py --provider local --local-preset ollama --list-models
 ```sh
 python3 -m venv venv
 source venv/bin/activate
+git clone https://github.com/vehoelite/AI_Installer.git
+wget 
 pip install anthropic  # or openai
 export ANTHROPIC_API_KEY="your-key"  # or OPENAI_API_KEY or GEMINI_API_KEY
+# if using gguf
+
 ```
 
 # Prerequisites for GUI
