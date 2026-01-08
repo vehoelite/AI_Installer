@@ -177,6 +177,8 @@ pip install openai
 # using Google Gemini
 pip install google-genai
 pip install PySide6
+# if using gguf
+pip install llama-cpp-python
 python ai_installer_gui.py
 ```
 
